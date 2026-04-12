@@ -1,0 +1,72 @@
+[project]
+name = "claude-mv"
+version = "0.6.0"
+description = "Update Claude Code's internal state when a project directory moves"
+requires-python = ">=3.11"
+dependencies = []
+license = "MIT"
+authors = [
+    { name = "Justin Stimatze", email = "justin@justinstimatze.com" },
+]
+readme = "README.md"
+
+[project.urls]
+Homepage = "https://github.com/justinstimatze/claude-mv"
+Repository = "https://github.com/justinstimatze/claude-mv"
+
+[project.scripts]
+claude-mv = "claude_mv:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+exclude = ["tests/", "bootstrap.md"]
+
+# Map the single-file script for hatch
+[tool.hatch.build.targets.wheel.sources]
+"claude-mv" = "claude_mv.py"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "A",     # flake8-builtins
+    "SIM",   # flake8-simplify
+    "RUF",   # ruff-specific
+    "S",     # flake8-bandit (security)
+]
+ignore = [
+    "S603",  # subprocess-without-shell-check
+    "S607",  # start-process-with-partial-path
+    "SIM105", # contextlib.suppress — try/except/pass is clearer in atomic_write
+    "SIM108", # ternary — explicit if/else is clearer
+    "E501",  # line length — handled by formatter
+    "UP015", # unnecessary open mode "r" — explicit is fine
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert is fine in tests
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

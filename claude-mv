@@ -1,0 +1,1106 @@
+#!/usr/bin/env python3
+"""claude-mv: Move a Claude Code project to a new directory path,
+updating all path-dependent internal state so --continue, memory,
+and session history keep working.
+
+Usage: claude-mv <old-path> <new-path> [flags]
+       claude-mv <new-path> [flags]           # auto-detect old path
+
+Layers updated:
+  1. ~/.claude/projects/<encoded>/          directory rename / deep merge
+  2. *.jsonl files                          cwd + file_path fields
+  3. subagent *.jsonl + *.meta.json         stale paths in subagent transcripts
+  4. memory/ files                          path refs in memory content
+  5. ~/.claude/history.jsonl                "project" field
+  6. ~/.claude.json                         project key in "projects" object
+  7. <new>/.mcp.json                        absolute paths in MCP config
+  8. <new>/.claude/settings[.local].json    path refs in project settings
+  9. ~/.claude/sessions/*.json              stale cwd in session tracking
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import sys
+import tempfile
+import traceback
+from pathlib import Path
+
+VERSION = "0.6.0"
+
+# ── Exit codes ────────────────────────────────────────────────────────
+EXIT_OK = 0
+EXIT_FATAL = 1
+EXIT_NOOP = 2
+EXIT_ACTIVE_SESSION = 3
+EXIT_ROLLBACK = 4
+
+# ── Global accumulators ───────────────────────────────────────────────
+changes: list[dict] = []
+warnings: list[str] = []
+errors: list[str] = []
+backup_dir: str | None = None
+backup_manifest: list[tuple[str, str]] = []  # (backup_path, original_path)
+backup_renames: list[tuple[str, str]] = []  # (from, to) for dir renames
+modified_files: list[str] = []  # track for post-migration verification
+json_mode = False
+dry_run = False
+migration_in_progress = False  # set True during layer execution
+
+
+def _signal_handler(signum: int, frame) -> None:
+    """Handle SIGINT/SIGTERM: rollback if mid-migration, then exit."""
+    sig_name = signal.Signals(signum).name
+    if migration_in_progress and not dry_run:
+        print(f"\n[claude-mv] Interrupted ({sig_name}) — rolling back...", file=sys.stderr)
+        rollback()
+        if json_mode:
+            err(f"Interrupted by {sig_name}")
+            emit_json_report(EXIT_ROLLBACK)
+        else:
+            print(f"[claude-mv] ROLLED BACK after {sig_name}", file=sys.stderr)
+        sys.exit(EXIT_ROLLBACK)
+    else:
+        print(f"\n[claude-mv] Interrupted ({sig_name})", file=sys.stderr)
+        sys.exit(EXIT_FATAL)
+
+
+# ── Logging (always stderr so --json stdout stays clean) ──────────────
+def log(msg: str) -> None:
+    if not json_mode:
+        print(f"[claude-mv] {msg}", file=sys.stderr)
+
+
+def warn(msg: str) -> None:
+    warnings.append(msg)
+    print(f"[claude-mv] WARNING: {msg}", file=sys.stderr)
+
+
+def err(msg: str) -> None:
+    errors.append(msg)
+    print(f"[claude-mv] ERROR: {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = EXIT_FATAL) -> None:
+    err(msg)
+    if json_mode:
+        emit_json_report(code)
+    sys.exit(code)
+
+
+def add_change(layer: int, file: str, description: str) -> None:
+    changes.append({"layer": layer, "file": file, "description": description})
+    log(f"  L{layer}: {description}")
+
+
+# ── Backup / Rollback ────────────────────────────────────────────────
+def create_backup() -> str:
+    global backup_dir
+    backup_dir = tempfile.mkdtemp(prefix="claude-mv-backup.")
+    log(f"Backup dir: {backup_dir}")
+    return backup_dir
+
+
+def backup_file(filepath: str) -> None:
+    if dry_run or backup_dir is None:
+        return
+    # Use relpath from / so projects outside $HOME don't escape the backup dir
+    rel = os.path.relpath(os.path.abspath(filepath), "/")
+    dest = os.path.join(backup_dir, rel)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(filepath, dest)
+    backup_manifest.append((dest, filepath))
+
+
+def rollback() -> None:
+    if backup_dir is None:
+        return
+    log("Rolling back changes...")
+    for backup_path, original_path in reversed(backup_manifest):
+        try:
+            shutil.copy2(backup_path, original_path)
+            log(f"  Restored {original_path}")
+        except OSError as e:
+            err(f"Rollback failed for {original_path}: {e}")
+    for src, dst in reversed(backup_renames):
+        try:
+            if os.path.isfile(dst) and not os.path.exists(src):
+                # Reverse individual file move (from deep_merge_dirs)
+                os.makedirs(os.path.dirname(src), exist_ok=True)
+                shutil.move(dst, src)
+                log(f"  Reversed file move {dst} -> {src}")
+            elif os.path.isdir(dst) and not os.path.isdir(src):
+                # Reverse directory rename (from Layer 1 simple rename)
+                shutil.move(dst, src)
+                log(f"  Reversed rename {dst} -> {src}")
+        except OSError as e:
+            err(f"Rollback rename failed {dst} -> {src}: {e}")
+
+
+# ── Safe replacement (str.replace — always literal) ───────────────────
+def atomic_write(
+    filepath: str, content: str, encoding: str = "utf-8", encoding_errors: str = "strict"
+) -> None:
+    """Write content to file atomically via temp file + rename."""
+    # Resolve symlinks so we write to the target, preserving the link
+    filepath = os.path.realpath(filepath)
+    dirpath = os.path.dirname(filepath)
+    fd, tmp = tempfile.mkstemp(dir=dirpath, prefix=".claude-mv-")
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, errors=encoding_errors) as f:
+            f.write(content)
+        try:
+            shutil.copystat(filepath, tmp)  # preserve permissions/timestamps
+        except OSError:
+            pass  # non-fatal: timestamps/permissions are nice-to-have
+        os.rename(tmp, filepath)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def replace_in_file(filepath: str, old: str, new: str) -> int:
+    """Replace all occurrences of `old` with `new` in file. Returns count."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="surrogateescape") as f:
+            content = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        warn(f"Cannot read {filepath}: {e}")
+        return 0
+
+    count = content.count(old)
+    if count == 0:
+        return 0
+
+    if not dry_run:
+        try:
+            backup_file(filepath)
+            new_content = content.replace(old, new)
+            atomic_write(filepath, new_content, encoding_errors="surrogateescape")
+            modified_files.append(filepath)
+        except OSError as e:
+            warn(f"Cannot write {filepath}: {e}")
+            return 0
+
+    return count
+
+
+def rewrite_paths_in_file(
+    filepath: str, old_path: str, new_path: str, old_encoded: str, new_encoded: str
+) -> int:
+    """Replace both literal and encoded path forms atomically. Returns total count."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="surrogateescape") as f:
+            content = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        warn(f"Cannot read {filepath}: {e}")
+        return 0
+
+    c1 = content.count(old_path)
+    c2 = content.count(old_encoded)
+    total = c1 + c2
+    if total == 0:
+        return 0
+
+    if not dry_run:
+        try:
+            backup_file(filepath)  # single backup of original content
+            # Order matters: if new_path contains old_encoded, we must replace
+            # encoded first to avoid corrupting the freshly-inserted new_path.
+            if old_encoded in new_path:
+                new_content = content.replace(old_encoded, new_encoded).replace(old_path, new_path)
+            else:
+                new_content = content.replace(old_path, new_path).replace(old_encoded, new_encoded)
+            atomic_write(filepath, new_content, encoding_errors="surrogateescape")
+            modified_files.append(filepath)
+        except OSError as e:
+            warn(f"Cannot write {filepath}: {e}")
+            return 0
+
+    return total
+
+
+# ── JSON validation ───────────────────────────────────────────────────
+def validate_json(filepath: str) -> bool:
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            json.load(f)
+        return True
+    except (json.JSONDecodeError, OSError) as e:
+        warn(f"JSON validation failed for {filepath}: {e}")
+        return False
+
+
+# ── Encoding (must match Claude Code's internal scheme) ───────────────
+def encode_path(path: str) -> str:
+    """Encode a path the same way Claude Code does: replace /._- with -"""
+    result = ""
+    for ch in path:
+        if ch in ("/", ".", "_", "-"):
+            result += "-"
+        else:
+            result += ch
+    return result
+
+
+# ── Active session detection ──────────────────────────────────────────
+def check_active_sessions(old_path: str, force: bool) -> list[dict]:
+    """Check ~/.claude/sessions/ for live sessions on old_path. Returns list of active sessions."""
+    sessions_dir = os.path.expanduser("~/.claude/sessions")
+    if not os.path.isdir(sessions_dir):
+        return []
+
+    active = []
+    for fname in os.listdir(sessions_dir):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(sessions_dir, fname)
+        try:
+            with open(fpath, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        cwd = data.get("cwd", "")
+        pid = data.get("pid")
+        if not (cwd == old_path or cwd.startswith(old_path + "/")):
+            continue
+
+        # Check if PID is alive
+        alive = False
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        if alive:
+            session_info = {
+                "pid": pid,
+                "cwd": cwd,
+                "sessionId": data.get("sessionId", "?"),
+                "file": fpath,
+            }
+            active.append(session_info)
+            if force:
+                warn(
+                    f"Active session pid={pid} on {cwd} (--force, continuing). "
+                    f"Messages sent during migration may be lost."
+                )
+            else:
+                err(f"Active session pid={pid} on {cwd} — use --force to override")
+        else:
+            log(f"  Stale session file {fname} (pid={pid} dead)")
+
+    return active
+
+
+# ── Auto-detect old path ──────────────────────────────────────────────
+def auto_detect_old_path(new_path: str) -> str | None:
+    """Scan ~/.claude/projects/ for orphaned dirs that might be the old location."""
+    projects_dir = os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(projects_dir):
+        return None
+
+    new_basename = os.path.basename(new_path)
+    new_encoded = encode_path(new_path)
+    candidates: list[tuple[str, int]] = []  # (encoded_dirname, score)
+
+    # Read ~/.claude.json once for cross-referencing (not per-candidate)
+    cj_projects: dict = {}
+    claude_json_check = os.path.expanduser("~/.claude.json")
+    if os.path.isfile(claude_json_check):
+        try:
+            with open(claude_json_check, "r") as f:
+                cj_projects = json.load(f).get("projects", {})
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    for dirname in os.listdir(projects_dir):
+        dirpath = os.path.join(projects_dir, dirname)
+        if not os.path.isdir(dirpath):
+            continue
+        if dirname == new_encoded:
+            continue  # that's the new path's dir, skip
+
+        # Check if it's orphaned. Encoding is lossy (/._- all become -),
+        # so we check multiple decode guesses. If ANY guess exists, it's not orphaned.
+        base = dirname[1:]  # strip leading -
+        guesses = [
+            "/" + base.replace("-", "/"),  # all - -> /
+        ]
+        is_orphaned = True
+        for guess in guesses:
+            if os.path.isdir(guess):
+                is_orphaned = False
+                break
+        if not is_orphaned:
+            continue
+        # Cross-check: does any key in ~/.claude.json encode to this dirname?
+        for key in cj_projects:
+            if encode_path(key) == dirname and os.path.isdir(key):
+                is_orphaned = False
+                break
+        if not is_orphaned:
+            continue  # not orphaned
+
+        # Score by basename similarity
+        score = 0
+        if new_basename.lower() in dirname.lower():
+            score += 3
+        # Check if it shares path components
+        new_parts = set(new_path.strip("/").split("/"))
+        dir_parts = set(dirname.strip("-").split("-"))
+        overlap = len(new_parts & dir_parts)
+        score += overlap
+
+        if score > 0:
+            candidates.append((dirname, score))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: -c[1])
+    best_encoded, best_score = candidates[0]
+
+    if best_score >= 3 and (len(candidates) == 1 or candidates[0][1] > candidates[1][1]):
+        # High confidence single match
+        # Try to reconstruct the old path from history.jsonl for exact match
+        history = os.path.expanduser("~/.claude/history.jsonl")
+        if os.path.isfile(history):
+            try:
+                with open(history, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        project = entry.get("project", "")
+                        if encode_path(project) == best_encoded:
+                            log(f"Auto-detected old path from history: {project}")
+                            return project
+            except OSError:
+                pass
+
+        log(f"Best candidate: {best_encoded} (score={best_score})")
+        return None  # can't decode unambiguously without history match
+
+    # Multiple candidates or low confidence
+    log("Auto-detect candidates:")
+    for enc, sc in candidates[:5]:
+        log(f"  {enc} (score={sc})")
+    return None
+
+
+# ── Encoding collision detection ──────────────────────────────────────
+def check_encoding_collision(
+    old_path: str, new_path: str, old_encoded: str, new_encoded: str
+) -> bool:
+    """Check if new_encoded already exists for a DIFFERENT project."""
+    projects_dir = os.path.expanduser("~/.claude/projects")
+    new_project_dir = os.path.join(projects_dir, new_encoded)
+
+    if not os.path.isdir(new_project_dir):
+        return False  # no collision
+
+    # It exists. Is it from old_path (stale) or a genuinely different project?
+    # Check history.jsonl for any project that encodes to new_encoded but isn't old_path or new_path
+    history = os.path.expanduser("~/.claude/history.jsonl")
+    if os.path.isfile(history):
+        try:
+            with open(history, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    project = entry.get("project", "")
+                    if (
+                        encode_path(project) == new_encoded
+                        and project != old_path
+                        and project != new_path
+                    ):
+                        warn(
+                            f"Encoding collision: {new_encoded} also matches "
+                            f"project '{project}'. Paths with . and / can collide "
+                            f"in Claude Code's encoding scheme."
+                        )
+                        return True
+        except OSError:
+            pass
+
+    return False
+
+
+# ── Deep merge directories ────────────────────────────────────────────
+def deep_merge_dirs(src: str, dst: str) -> int:
+    """Recursively move files from src to dst without overwriting. Returns move count."""
+    moved = 0
+    for root, _dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        dst_root = os.path.join(dst, rel) if rel != "." else dst
+
+        for fname in files:
+            src_file = os.path.join(root, fname)
+            dst_file = os.path.join(dst_root, fname)
+            if os.path.exists(dst_file):
+                warn(f"Merge conflict, skipped: {os.path.relpath(src_file, src)}")
+            else:
+                if not dry_run:
+                    os.makedirs(dst_root, exist_ok=True)
+                    shutil.move(src_file, dst_file)
+                    # Track for rollback so we can reverse individual file moves
+                    backup_renames.append((src_file, dst_file))
+                moved += 1
+
+    # Clean up empty dirs in src
+    if not dry_run:
+        for root, dirs, _files in os.walk(src, topdown=False):
+            for d in dirs:
+                try:
+                    os.rmdir(os.path.join(root, d))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+
+    return moved
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MIGRATION LAYERS
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def migrate_layer1_project_dir(old_encoded: str, new_encoded: str, claude_dir: str) -> bool:
+    """Layer 1: Rename or deep-merge the project directory."""
+    log("Layer 1: Project directory")
+
+    if old_encoded == new_encoded:
+        log("  Encoded forms identical — no directory rename needed")
+        return True
+
+    old_dir = os.path.join(claude_dir, "projects", old_encoded)
+    new_dir = os.path.join(claude_dir, "projects", new_encoded)
+
+    if not os.path.isdir(old_dir):
+        log("  Old project dir not found (already migrated?)")
+        return True
+
+    if os.path.isdir(new_dir):
+        # Both exist — deep merge
+        log("  Both dirs exist, deep merging...")
+        count = deep_merge_dirs(old_dir, new_dir)
+        add_change(1, old_dir, f"Deep-merged {count} files into {new_encoded}")
+    else:
+        # Simple rename
+        if not dry_run:
+            backup_renames.append((old_dir, new_dir))
+            shutil.move(old_dir, new_dir)
+        add_change(1, old_dir, f"Renamed {old_encoded} -> {new_encoded}")
+
+    return True
+
+
+def migrate_layer2_jsonl(
+    new_project_dir: str,
+    old_path: str,
+    new_path: str,
+    old_encoded: str,
+    new_encoded: str,
+) -> bool:
+    """Layer 2: Rewrite paths in session JSONL files.
+
+    Note: Uses blind str.replace which may alter paths appearing in user/assistant
+    message text (not just structural fields). This is an accepted trade-off —
+    JSON-aware per-field replacement of multi-MB transcripts is impractical and
+    the functional fields (cwd, file_path) must be updated for --continue to work.
+    """
+    log("Layer 2: Session transcripts")
+    if not os.path.isdir(new_project_dir):
+        log("  No project dir, skipping")
+        return True
+
+    for fpath in Path(new_project_dir).rglob("*.jsonl"):
+        count = rewrite_paths_in_file(str(fpath), old_path, new_path, old_encoded, new_encoded)
+        if count > 0:
+            add_change(2, str(fpath), f"Rewrote {count} refs in {fpath.name}")
+
+    return True
+
+
+def migrate_layer3_subagents(
+    new_project_dir: str,
+    old_path: str,
+    new_path: str,
+    old_encoded: str,
+    new_encoded: str,
+) -> bool:
+    """Layer 3: Rewrite paths in subagent meta files."""
+    log("Layer 3: Subagent metadata")
+    if not os.path.isdir(new_project_dir):
+        log("  No project dir, skipping")
+        return True
+
+    for fpath in Path(new_project_dir).rglob("*.meta.json"):
+        count = rewrite_paths_in_file(str(fpath), old_path, new_path, old_encoded, new_encoded)
+        if count > 0:
+            add_change(3, str(fpath), f"Rewrote {count} refs in {fpath.name}")
+
+    return True
+
+
+def migrate_layer4_memory(
+    new_project_dir: str,
+    old_path: str,
+    new_path: str,
+    old_encoded: str,
+    new_encoded: str,
+) -> bool:
+    """Layer 4: Rewrite path refs in memory files."""
+    log("Layer 4: Memory files")
+    memory_dir = os.path.join(new_project_dir, "memory")
+    if not os.path.isdir(memory_dir):
+        log("  No memory dir (OK)")
+        return True
+
+    for fpath in Path(memory_dir).rglob("*"):
+        if fpath.is_file():
+            count = rewrite_paths_in_file(str(fpath), old_path, new_path, old_encoded, new_encoded)
+            if count > 0:
+                add_change(4, str(fpath), f"Rewrote {count} refs in {fpath.name}")
+
+    return True
+
+
+def migrate_layer5_history(
+    old_path: str, new_path: str, old_encoded: str, new_encoded: str
+) -> bool:
+    """Layer 5: Rewrite project field in history.jsonl (JSON-aware, not blind str.replace).
+
+    Using str.replace on history.jsonl would corrupt sibling projects whose paths
+    share a prefix with old_path (e.g., /app vs /app-staging). Instead, we parse
+    each line as JSON and only modify the "project" field on exact match.
+    """
+    log("Layer 5: history.jsonl")
+    history = os.path.expanduser("~/.claude/history.jsonl")
+    if not os.path.isfile(history):
+        log("  No history.jsonl (OK)")
+        return True
+
+    try:
+        with open(history, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError as e:
+        warn(f"Cannot read history.jsonl: {e}")
+        return True
+
+    new_lines = []
+    count = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            new_lines.append(line)
+            continue
+        try:
+            entry = json.loads(stripped)
+            project = entry.get("project", "")
+            if project == old_path or project.startswith(old_path + "/"):
+                new_project = new_path + project[len(old_path) :]
+                # Splice only the "project" value, anchored to the key name,
+                # to avoid replacing an identical value in a different field.
+                old_fragment = json.dumps(project)
+                new_fragment = json.dumps(new_project)
+                replacement = '"project": ' + new_fragment
+                patched = re.sub(
+                    r'"project"\s*:\s*' + re.escape(old_fragment),
+                    lambda m, r=replacement: r,
+                    stripped,
+                    count=1,
+                )
+                new_lines.append(patched + "\n")
+                count += 1
+            else:
+                new_lines.append(line)
+        except json.JSONDecodeError:
+            new_lines.append(line)
+
+    if count > 0:
+        if not dry_run:
+            backup_file(history)
+            atomic_write(history, "".join(new_lines))
+            modified_files.append(history)
+        add_change(5, history, f"Rewrote {count} project entries")
+    return True
+
+
+def migrate_layer6_claude_json(old_path: str, new_path: str) -> bool:
+    """Layer 6: Update project key in ~/.claude.json."""
+    log("Layer 6: ~/.claude.json")
+    claude_json = os.path.expanduser("~/.claude.json")
+    if not os.path.isfile(claude_json):
+        log("  No ~/.claude.json (OK)")
+        return True
+
+    try:
+        with open(claude_json, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        err(f"Cannot read ~/.claude.json: {e}")
+        return False
+
+    projects = data.get("projects", {})
+    changed = False
+
+    # Path-boundary-aware replacement for JSON values: only replace old_path
+    # when followed by / (subpath), " (end of JSON string), or end of string.
+    # This prevents /app from corrupting /app-staging.
+    path_pattern = re.compile(re.escape(old_path) + r'(?=[/"]|$)')
+
+    # Rename exact key and rewrite paths in values
+    if old_path in projects:
+        val_str = json.dumps(projects.pop(old_path))
+        val_str = path_pattern.sub(lambda m: new_path, val_str)
+        projects[new_path] = json.loads(val_str)
+        changed = True
+
+    # Rename sub-project keys (e.g. /old/path/subdir)
+    for key in list(projects.keys()):
+        if key.startswith(old_path + "/"):
+            new_key = new_path + key[len(old_path) :]
+            val_str = json.dumps(projects.pop(key))
+            val_str = path_pattern.sub(lambda m: new_path, val_str)
+            projects[new_key] = json.loads(val_str)
+            changed = True
+
+    if not changed:
+        log("  No matching project key")
+        return True
+
+    data["projects"] = projects
+
+    if not dry_run:
+        backup_file(claude_json)
+        output = json.dumps(data, indent=2) + "\n"
+        atomic_write(claude_json, output)
+        modified_files.append(claude_json)
+
+        if not validate_json(claude_json):
+            err("~/.claude.json corrupted after rewrite!")
+            return False
+
+    add_change(6, claude_json, "Updated project key(s)")
+    return True
+
+
+def migrate_layer7_mcp_json(
+    new_path: str,
+    old_path: str,
+    old_encoded: str,
+    new_encoded: str,
+) -> bool:
+    """Layer 7: Rewrite absolute paths in .mcp.json."""
+    log("Layer 7: .mcp.json")
+    mcp_json = os.path.join(new_path, ".mcp.json")
+    if not os.path.isfile(mcp_json):
+        log("  No .mcp.json (OK)")
+        return True
+
+    count = rewrite_paths_in_file(mcp_json, old_path, new_path, old_encoded, new_encoded)
+    if count > 0:
+        add_change(7, mcp_json, f"Rewrote {count} refs")
+        if not dry_run and not validate_json(mcp_json):
+            err(".mcp.json corrupted after rewrite!")
+            return False
+    return True
+
+
+def migrate_layer8_settings(
+    new_path: str,
+    old_path: str,
+    old_encoded: str,
+    new_encoded: str,
+) -> bool:
+    """Layer 8: Rewrite paths in project settings files."""
+    log("Layer 8: Project settings")
+    for name in ("settings.json", "settings.local.json"):
+        fpath = os.path.join(new_path, ".claude", name)
+        if not os.path.isfile(fpath):
+            continue
+        count = rewrite_paths_in_file(fpath, old_path, new_path, old_encoded, new_encoded)
+        if count > 0:
+            add_change(8, fpath, f"Rewrote {count} refs in {name}")
+            if not dry_run and not validate_json(fpath):
+                err(f"{name} corrupted after rewrite!")
+                return False
+    return True
+
+
+def migrate_layer9_sessions(old_path: str, new_path: str) -> bool:
+    """Layer 9: Update cwd in ~/.claude/sessions/*.json for stale refs."""
+    log("Layer 9: Session files")
+    sessions_dir = os.path.expanduser("~/.claude/sessions")
+    if not os.path.isdir(sessions_dir):
+        log("  No sessions dir (OK)")
+        return True
+
+    for fname in os.listdir(sessions_dir):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(sessions_dir, fname)
+        try:
+            with open(fpath, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        cwd = data.get("cwd", "")
+        if cwd != old_path and not cwd.startswith(old_path + "/"):
+            continue
+
+        # Check if PID is dead (only update stale sessions)
+        pid = data.get("pid")
+        alive = False
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        if alive:
+            log(f"  Skipping {fname} (session still active, pid={pid})")
+            continue
+
+        new_cwd = new_path + cwd[len(old_path) :]
+        data["cwd"] = new_cwd
+
+        if not dry_run:
+            backup_file(fpath)
+            atomic_write(fpath, json.dumps(data, indent=2) + "\n")
+            modified_files.append(fpath)
+
+        add_change(9, fpath, f"Updated cwd in {fname}")
+
+    return True
+
+
+# ── Post-migration verification ───────────────────────────────────────
+def verify_no_residual(old_path: str, new_path: str, old_encoded: str, new_encoded: str) -> None:
+    """Check modified files for any remaining old path references."""
+    log("Verification: checking for residual old paths...")
+    residual_count = 0
+    for fpath in modified_files:
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="surrogateescape") as f:
+                content = f.read()
+            for needle, replacement in ((old_path, new_path), (old_encoded, new_encoded)):
+                hits = content.count(needle)
+                # Subtract occurrences that are part of the replacement string
+                # (e.g., /home/user/app inside /home/user/app-v2)
+                if needle in replacement:
+                    # Each replacement occurrence contributes K needle matches
+                    k = replacement.count(needle)
+                    hits -= content.count(replacement) * k
+                if hits > 0:
+                    warn(f"Residual: {hits} occurrence(s) of '{needle}' in {fpath}")
+                    residual_count += hits
+        except OSError:
+            pass
+
+    if residual_count == 0:
+        log("  Clean — no residual old path references found")
+    else:
+        warn(f"{residual_count} total residual old path reference(s) remain")
+
+
+# ── Report output ─────────────────────────────────────────────────────
+def emit_json_report(exit_code: int) -> None:
+    report = {
+        "success": exit_code in (EXIT_OK, EXIT_NOOP),
+        "exitCode": exit_code,
+        "version": VERSION,
+        "changes": changes,
+        "warnings": warnings,
+        "errors": errors,
+        "backupDir": backup_dir,
+        "dryRun": dry_run,
+    }
+    print(json.dumps(report, indent=2))
+
+
+def emit_human_report(exit_code: int, new_path: str) -> None:
+    print("", file=sys.stderr)
+    print("════════════════════════════════════════════", file=sys.stderr)
+    if dry_run:
+        log(f"DRY RUN: {len(changes)} change(s) would be made")
+    elif exit_code == EXIT_OK:
+        log(f"Done: {len(changes)} change(s) applied")
+    elif exit_code == EXIT_ROLLBACK:
+        log("ROLLED BACK after error — see above")
+    elif exit_code == EXIT_NOOP:
+        log("Nothing to do")
+
+    if warnings:
+        log(f"{len(warnings)} warning(s)")
+    if backup_dir and not dry_run:
+        log(f"Backup: {backup_dir}")
+    if exit_code == EXIT_OK and not dry_run:
+        if " " in new_path:
+            log(f'Verify: cd "{new_path}" && claude --continue')
+        else:
+            log(f"Verify: cd {new_path} && claude --continue")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def main() -> None:
+    global json_mode, dry_run
+
+    # Pre-scan flags so die() reports correctly even on early failures
+    json_mode = "--json" in sys.argv
+    dry_run = "--dry-run" in sys.argv
+
+    parser = argparse.ArgumentParser(
+        prog="claude-mv",
+        description="Move a Claude Code project's internal state to match a new directory location.",
+        epilog="The repo/directory itself must already be at new-path (use mv/cp first, then claude-mv).",
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        metavar="PATH",
+        help="<old-path> <new-path>, or just <new-path> for auto-detect",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would change without modifying anything"
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Machine-readable JSON output on stdout"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Proceed even if active sessions detected"
+    )
+    parser.add_argument("--version", action="version", version=f"claude-mv {VERSION}")
+    args = parser.parse_args()
+
+    json_mode = args.json
+    dry_run = args.dry_run
+
+    # ── Resolve paths ─────────────────────────────────────────────────
+    if len(args.paths) == 2:
+        old_path = os.path.realpath(args.paths[0])
+        new_path = os.path.realpath(args.paths[1])
+    elif len(args.paths) == 1:
+        new_path = os.path.realpath(args.paths[0])
+        log(f"Auto-detecting old path for: {new_path}")
+        detected = auto_detect_old_path(new_path)
+        if detected is None:
+            die("Could not auto-detect old path. Provide both: claude-mv <old> <new>")
+        old_path = os.path.realpath(detected)
+        log(f"Detected: {old_path}")
+    else:
+        die("Expected 1 or 2 path arguments")
+
+    # Guard against catastrophically short paths — replacing "/" would
+    # corrupt every forward slash in every file.
+    for label, p in [("Old", old_path), ("New", new_path)]:
+        parts = [x for x in p.split("/") if x]
+        if len(parts) < 2:
+            die(f"{label} path too short to be a project directory: {p}")
+
+    if old_path == new_path:
+        log("Old and new paths are identical — nothing to do")
+        if json_mode:
+            emit_json_report(EXIT_NOOP)
+        sys.exit(EXIT_NOOP)
+
+    # Guard against ancestor/descendant moves — str.replace would corrupt
+    # entries that already reference the longer path (double-suffix bug).
+    if new_path.startswith(old_path + "/"):
+        die(
+            f"New path is inside old path ({new_path} ⊂ {old_path}). "
+            f"Ancestor-to-descendant moves are not supported."
+        )
+    if old_path.startswith(new_path + "/"):
+        die(
+            f"Old path is inside new path ({old_path} ⊂ {new_path}). "
+            f"Descendant-to-ancestor moves are not supported."
+        )
+
+    if not os.path.isdir(new_path):
+        die(f"New path does not exist: {new_path} (move the repo first, then run claude-mv)")
+
+    claude_dir = os.path.expanduser("~/.claude")
+    if not os.path.isdir(claude_dir):
+        die("No ~/.claude directory found")
+
+    old_encoded = encode_path(old_path)
+    new_encoded = encode_path(new_path)
+    new_project_dir = os.path.join(claude_dir, "projects", new_encoded)
+
+    log(f"Old path:    {old_path}")
+    log(f"New path:    {new_path}")
+    log(f"Old encoded: {old_encoded}")
+    log(f"New encoded: {new_encoded}")
+    log(f"Dry run:     {dry_run}")
+    log("")
+
+    # ── Encoding collision check ──────────────────────────────────────
+    if check_encoding_collision(old_path, new_path, old_encoded, new_encoded):
+        die(f"Encoding collision detected for {new_encoded}. Aborting to prevent data loss.")
+
+    # ── Prefix collision check ────────────────────────────────────────
+    # Warn if old_path is a prefix of any sibling project (str.replace in
+    # per-project JSONL files is safe, but ~/.claude.json values could be
+    # affected if they reference sibling paths).
+    claude_json_path = os.path.expanduser("~/.claude.json")
+    if os.path.isfile(claude_json_path):
+        try:
+            with open(claude_json_path, "r") as f:
+                cj = json.load(f)
+            for key in cj.get("projects", {}):
+                if key != old_path and key.startswith(old_path + "/"):
+                    # Sub-project — this is expected and handled correctly
+                    pass
+                elif key != old_path and key.startswith(old_path):
+                    warn(
+                        f"Sibling project '{key}' shares prefix with old path '{old_path}'. "
+                        f"Layer 6 value rewriting may affect it — verify after migration."
+                    )
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # ── Active session check ──────────────────────────────────────────
+    active = check_active_sessions(old_path, args.force)
+    if active and not args.force:
+        if json_mode:
+            emit_json_report(EXIT_ACTIVE_SESSION)
+        sys.exit(EXIT_ACTIVE_SESSION)
+
+    # ── Pre-flight size estimate ─────────────────────────────────────
+    total_bytes = 0
+    history_path = os.path.expanduser("~/.claude/history.jsonl")
+    for check_path in [history_path]:
+        if os.path.isfile(check_path):
+            total_bytes += os.path.getsize(check_path)
+    old_project_dir_pre = os.path.join(claude_dir, "projects", old_encoded)
+    if os.path.isdir(old_project_dir_pre):
+        for root, _, fnames in os.walk(old_project_dir_pre):
+            for fn in fnames:
+                total_bytes += os.path.getsize(os.path.join(root, fn))
+    if total_bytes > 100_000_000:  # 100 MB
+        warn(
+            f"Large dataset ({total_bytes // 1_000_000} MB) — migration may use significant memory"
+        )
+
+    # ── Create backup ─────────────────────────────────────────────────
+    if not dry_run:
+        create_backup()
+
+    # ── Install signal handlers for clean rollback ────────────────────
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # ── Run all layers ────────────────────────────────────────────────
+    global migration_in_progress
+    old_project_dir = os.path.join(claude_dir, "projects", old_encoded)
+
+    # After layer 1, files live in new_project_dir. In dry-run, they're still in old.
+    def effective_project_dir() -> str:
+        if os.path.isdir(new_project_dir):
+            return new_project_dir
+        if os.path.isdir(old_project_dir):
+            return old_project_dir
+        return new_project_dir  # fallback
+
+    migration_in_progress = True
+    layer_ok = True
+    layers = [
+        (1, lambda: migrate_layer1_project_dir(old_encoded, new_encoded, claude_dir)),
+        (
+            2,
+            lambda: migrate_layer2_jsonl(
+                effective_project_dir(), old_path, new_path, old_encoded, new_encoded
+            ),
+        ),
+        (
+            3,
+            lambda: migrate_layer3_subagents(
+                effective_project_dir(), old_path, new_path, old_encoded, new_encoded
+            ),
+        ),
+        (
+            4,
+            lambda: migrate_layer4_memory(
+                effective_project_dir(), old_path, new_path, old_encoded, new_encoded
+            ),
+        ),
+        (5, lambda: migrate_layer5_history(old_path, new_path, old_encoded, new_encoded)),
+        (6, lambda: migrate_layer6_claude_json(old_path, new_path)),
+        (7, lambda: migrate_layer7_mcp_json(new_path, old_path, old_encoded, new_encoded)),
+        (8, lambda: migrate_layer8_settings(new_path, old_path, old_encoded, new_encoded)),
+        (9, lambda: migrate_layer9_sessions(old_path, new_path)),
+    ]
+    for layer_num, layer_fn in layers:
+        try:
+            if not layer_fn():
+                layer_ok = False
+                break
+        except Exception as e:
+            err(f"Layer {layer_num} failed: {e}")
+            traceback.print_exc(file=sys.stderr)
+            layer_ok = False
+            break
+    migration_in_progress = False
+
+    # ── Handle failure ────────────────────────────────────────────────
+    if not layer_ok and not dry_run:
+        rollback()
+        if json_mode:
+            emit_json_report(EXIT_ROLLBACK)
+        else:
+            emit_human_report(EXIT_ROLLBACK, new_path)
+        sys.exit(EXIT_ROLLBACK)
+
+    # ── Post-migration verification ───────────────────────────────────
+    if not dry_run and changes:
+        verify_no_residual(old_path, new_path, old_encoded, new_encoded)
+
+    # ── Report ────────────────────────────────────────────────────────
+    exit_code = EXIT_OK if changes else EXIT_NOOP
+
+    # Check for old directory before emitting report so it's included in JSON
+    if os.path.isdir(old_path) and not dry_run and exit_code == EXIT_OK:
+        warn(f"Old directory still exists at {old_path}")
+
+    if json_mode:
+        emit_json_report(exit_code)
+    else:
+        emit_human_report(exit_code, new_path)
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
