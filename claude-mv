@@ -31,6 +31,83 @@ from pathlib import Path
 
 VERSION = "0.6.0"
 
+# ── Platform helpers ──────────────────────────────────────────────────
+IS_WINDOWS = os.name == "nt"
+
+# Path separators we accept after a project root. On Windows both / and \
+# may appear (os.path.realpath produces \, but JSON config sometimes stores /).
+PATH_SEPS: tuple[str, ...] = ("/", "\\") if IS_WINDOWS else ("/",)
+
+
+def is_path_under(child: str, parent: str) -> bool:
+    """True if child equals parent or is nested under parent."""
+    if child == parent:
+        return True
+    return any(child.startswith(parent + s) for s in PATH_SEPS)
+
+
+def is_strictly_under(child: str, parent: str) -> bool:
+    """True if child is strictly nested under parent (not equal)."""
+    return any(child.startswith(parent + s) for s in PATH_SEPS)
+
+
+def path_segments(p: str) -> list[str]:
+    """Split a path into non-empty segments. On Windows, accepts /, \\, and :."""
+    if IS_WINDOWS:
+        return [x for x in re.split(r"[\\/:]", p) if x]
+    return [x for x in p.split("/") if x]
+
+
+def pid_alive(pid: int | None) -> bool:
+    """Cross-platform PID liveness check.
+
+    Note: on Windows, os.kill(pid, 0) does NOT probe — it calls TerminateProcess
+    with exit code 0 and would actually kill the process. We must use OpenProcess
+    + GetExitCodeProcess via ctypes instead.
+    """
+    if pid is None:
+        return False
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except ImportError:
+            return False
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        try:
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+        except (OSError, ValueError):
+            return False
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return exit_code.value == STILL_ACTIVE
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+        except OSError:
+            return False
+
+
+def json_string_content(s: str) -> str:
+    """Return the JSON encoding of s without surrounding quotes.
+
+    On Windows this doubles backslashes (path separator becomes \\\\ on disk).
+    On posix it is usually a no-op."""
+    return json.dumps(s)[1:-1]
+
 # ── Exit codes ────────────────────────────────────────────────────────
 EXIT_OK = 0
 EXIT_FATAL = 1
@@ -107,8 +184,16 @@ def create_backup() -> str:
 def backup_file(filepath: str) -> None:
     if dry_run or backup_dir is None:
         return
-    # Use relpath from / so projects outside $HOME don't escape the backup dir
-    rel = os.path.relpath(os.path.abspath(filepath), "/")
+    abspath = os.path.abspath(filepath)
+    if IS_WINDOWS:
+        # Strip the colon from the drive (C: -> C) so the backup tree is a
+        # valid relative path. relpath(..., "/") doesn't work across drives.
+        drive, tail = os.path.splitdrive(abspath)
+        rel = drive.rstrip(":") + tail
+        rel = rel.lstrip("\\").lstrip("/")
+    else:
+        # Use relpath from / so projects outside $HOME don't escape the backup dir
+        rel = os.path.relpath(abspath, "/")
     dest = os.path.join(backup_dir, rel)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     shutil.copy2(filepath, dest)
@@ -156,7 +241,9 @@ def atomic_write(
             shutil.copystat(filepath, tmp)  # preserve permissions/timestamps
         except OSError:
             pass  # non-fatal: timestamps/permissions are nice-to-have
-        os.rename(tmp, filepath)
+        # os.replace is atomic on both posix and Windows; os.rename on Windows
+        # would fail if the destination already exists.
+        os.replace(tmp, filepath)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -194,7 +281,14 @@ def replace_in_file(filepath: str, old: str, new: str) -> int:
 def rewrite_paths_in_file(
     filepath: str, old_path: str, new_path: str, old_encoded: str, new_encoded: str
 ) -> int:
-    """Replace both literal and encoded path forms atomically. Returns total count."""
+    """Replace literal, JSON-escaped (Windows), and encoded path forms atomically.
+
+    Returns total count of replacements made (across all forms).
+
+    On Windows, JSON files store backslashes escaped as \\\\, so a raw str.replace
+    of the literal path misses every reference inside JSON/JSONL. We additionally
+    rewrite the JSON-escaped form when paths contain backslashes.
+    """
     try:
         with open(filepath, "r", encoding="utf-8", errors="surrogateescape") as f:
             content = f.read()
@@ -202,21 +296,42 @@ def rewrite_paths_in_file(
         warn(f"Cannot read {filepath}: {e}")
         return 0
 
-    c1 = content.count(old_path)
-    c2 = content.count(old_encoded)
-    total = c1 + c2
+    # On Windows, also match the JSON-escaped form (each \ -> \\ in the file
+    # bytes). On posix this is usually a no-op (json doesn't escape /).
+    use_json_form = IS_WINDOWS and "\\" in old_path
+    if use_json_form:
+        old_json = json_string_content(old_path)
+        new_json = json_string_content(new_path)
+    else:
+        old_json = new_json = ""
+
+    c_json = content.count(old_json) if use_json_form else 0
+    c_path = content.count(old_path)
+    c_enc = content.count(old_encoded)
+    total = c_json + c_path + c_enc
     if total == 0:
         return 0
 
     if not dry_run:
         try:
             backup_file(filepath)  # single backup of original content
-            # Order matters: if new_path contains old_encoded, we must replace
-            # encoded first to avoid corrupting the freshly-inserted new_path.
+            # Replacement ordering rationale:
+            #   - JSON-escaped form first: it's strictly longer than the raw form
+            #     (because of the doubled backslashes) and contains the raw form
+            #     as a substring of itself, so we must finish JSON-escaped subs
+            #     before touching the raw path.
+            #   - Raw path next, then encoded — unless old_encoded would appear
+            #     inside the freshly-inserted new_path, in which case do encoded
+            #     first to avoid corrupting it.
+            new_content = content
+            if use_json_form:
+                new_content = new_content.replace(old_json, new_json)
             if old_encoded in new_path:
-                new_content = content.replace(old_encoded, new_encoded).replace(old_path, new_path)
+                new_content = new_content.replace(old_encoded, new_encoded)
+                new_content = new_content.replace(old_path, new_path)
             else:
-                new_content = content.replace(old_path, new_path).replace(old_encoded, new_encoded)
+                new_content = new_content.replace(old_path, new_path)
+                new_content = new_content.replace(old_encoded, new_encoded)
             atomic_write(filepath, new_content, encoding_errors="surrogateescape")
             modified_files.append(filepath)
         except OSError as e:
@@ -238,15 +353,16 @@ def validate_json(filepath: str) -> bool:
 
 
 # ── Encoding (must match Claude Code's internal scheme) ───────────────
+# POSIX: /, ., _, - all collapse to -.
+# Windows: in addition, : (drive separator) and \ (path separator) collapse to -.
+_ENCODE_CHARS_POSIX = frozenset(("/", ".", "_", "-"))
+_ENCODE_CHARS_WINDOWS = frozenset(("/", "\\", ":", ".", "_", "-"))
+
+
 def encode_path(path: str) -> str:
-    """Encode a path the same way Claude Code does: replace /._- with -"""
-    result = ""
-    for ch in path:
-        if ch in ("/", ".", "_", "-"):
-            result += "-"
-        else:
-            result += ch
-    return result
+    """Encode a path the same way Claude Code does."""
+    encode_chars = _ENCODE_CHARS_WINDOWS if IS_WINDOWS else _ENCODE_CHARS_POSIX
+    return "".join("-" if ch in encode_chars else ch for ch in path)
 
 
 # ── Active session detection ──────────────────────────────────────────
@@ -262,24 +378,17 @@ def check_active_sessions(old_path: str, force: bool) -> list[dict]:
             continue
         fpath = os.path.join(sessions_dir, fname)
         try:
-            with open(fpath, "r") as f:
+            with open(fpath, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
 
         cwd = data.get("cwd", "")
         pid = data.get("pid")
-        if not (cwd == old_path or cwd.startswith(old_path + "/")):
+        if not is_path_under(cwd, old_path):
             continue
 
-        # Check if PID is alive
-        alive = False
-        if pid is not None:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except (ProcessLookupError, PermissionError):
-                pass
+        alive = pid_alive(pid)
 
         if alive:
             session_info = {
@@ -318,9 +427,9 @@ def auto_detect_old_path(new_path: str) -> str | None:
     claude_json_check = os.path.expanduser("~/.claude.json")
     if os.path.isfile(claude_json_check):
         try:
-            with open(claude_json_check, "r") as f:
+            with open(claude_json_check, "r", encoding="utf-8") as f:
                 cj_projects = json.load(f).get("projects", {})
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             pass
 
     for dirname in os.listdir(projects_dir):
@@ -330,12 +439,23 @@ def auto_detect_old_path(new_path: str) -> str | None:
         if dirname == new_encoded:
             continue  # that's the new path's dir, skip
 
-        # Check if it's orphaned. Encoding is lossy (/._- all become -),
-        # so we check multiple decode guesses. If ANY guess exists, it's not orphaned.
-        base = dirname[1:]  # strip leading -
-        guesses = [
-            "/" + base.replace("-", "/"),  # all - -> /
-        ]
+        # Check if it's orphaned. Encoding is lossy (separators and . _ - all
+        # become -), so we generate plausible decoded forms; if ANY decoded form
+        # is a real directory, the encoded entry is still in use.
+        guesses: list[str] = []
+        if IS_WINDOWS:
+            # Typical Windows encoded form: drive letter + "--" + rest, since
+            # ":" and "\" both collapse to "-". E.g. "C--Users-foo" comes from
+            # "C:\Users\foo". Try both \ and / as the inferred separator.
+            if len(dirname) >= 3 and dirname[1:3] == "--":
+                drive = dirname[0]
+                rest = dirname[3:]
+                guesses.append(drive + ":\\" + rest.replace("-", "\\"))
+                guesses.append(drive + ":/" + rest.replace("-", "/"))
+        else:
+            base = dirname[1:]  # strip leading -
+            guesses.append("/" + base.replace("-", "/"))
+
         is_orphaned = True
         for guess in guesses:
             if os.path.isdir(guess):
@@ -356,7 +476,7 @@ def auto_detect_old_path(new_path: str) -> str | None:
         if new_basename.lower() in dirname.lower():
             score += 3
         # Check if it shares path components
-        new_parts = set(new_path.strip("/").split("/"))
+        new_parts = set(x for x in path_segments(new_path) if x)
         dir_parts = set(dirname.strip("-").split("-"))
         overlap = len(new_parts & dir_parts)
         score += overlap
@@ -376,7 +496,7 @@ def auto_detect_old_path(new_path: str) -> str | None:
         history = os.path.expanduser("~/.claude/history.jsonl")
         if os.path.isfile(history):
             try:
-                with open(history, "r") as f:
+                with open(history, "r", encoding="utf-8", errors="surrogateescape") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -418,7 +538,7 @@ def check_encoding_collision(
     history = os.path.expanduser("~/.claude/history.jsonl")
     if os.path.isfile(history):
         try:
-            with open(history, "r") as f:
+            with open(history, "r", encoding="utf-8", errors="surrogateescape") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -620,7 +740,7 @@ def migrate_layer5_history(
         try:
             entry = json.loads(stripped)
             project = entry.get("project", "")
-            if project == old_path or project.startswith(old_path + "/"):
+            if is_path_under(project, old_path):
                 new_project = new_path + project[len(old_path) :]
                 # Splice only the "project" value, anchored to the key name,
                 # to avoid replacing an identical value in a different field.
@@ -658,33 +778,47 @@ def migrate_layer6_claude_json(old_path: str, new_path: str) -> bool:
         return True
 
     try:
-        with open(claude_json, "r") as f:
+        with open(claude_json, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
         err(f"Cannot read ~/.claude.json: {e}")
         return False
 
     projects = data.get("projects", {})
     changed = False
 
-    # Path-boundary-aware replacement for JSON values: only replace old_path
-    # when followed by / (subpath), " (end of JSON string), or end of string.
-    # This prevents /app from corrupting /app-staging.
-    path_pattern = re.compile(re.escape(old_path) + r'(?=[/"]|$)')
+    # Path-boundary-aware replacement for JSON values: we run the regex on
+    # json.dumps() output, where any backslashes in the path are doubled.
+    # The pattern must therefore match the JSON-escaped form, and the
+    # replacement must also be the JSON-escaped form. Boundary alternatives:
+    #   "  → end of JSON string
+    #   /  → subpath separator (also legal inside Windows JSON paths)
+    #   \\ → JSON-escaped backslash separator (Windows only)
+    #   $  → end of input
+    old_in_json = json_string_content(old_path)
+    new_in_json = json_string_content(new_path)
+    if IS_WINDOWS:
+        boundary = r'(?=["/]|\\\\|$)'
+    else:
+        boundary = r'(?=["/]|$)'
+    path_pattern = re.compile(re.escape(old_in_json) + boundary)
+
+    def _sub_path(_m: "re.Match[str]", r: str = new_in_json) -> str:
+        return r
 
     # Rename exact key and rewrite paths in values
     if old_path in projects:
         val_str = json.dumps(projects.pop(old_path))
-        val_str = path_pattern.sub(lambda m: new_path, val_str)
+        val_str = path_pattern.sub(_sub_path, val_str)
         projects[new_path] = json.loads(val_str)
         changed = True
 
     # Rename sub-project keys (e.g. /old/path/subdir)
     for key in list(projects.keys()):
-        if key.startswith(old_path + "/"):
+        if is_strictly_under(key, old_path):
             new_key = new_path + key[len(old_path) :]
             val_str = json.dumps(projects.pop(key))
-            val_str = path_pattern.sub(lambda m: new_path, val_str)
+            val_str = path_pattern.sub(_sub_path, val_str)
             projects[new_key] = json.loads(val_str)
             changed = True
 
@@ -764,26 +898,18 @@ def migrate_layer9_sessions(old_path: str, new_path: str) -> bool:
             continue
         fpath = os.path.join(sessions_dir, fname)
         try:
-            with open(fpath, "r") as f:
+            with open(fpath, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
 
         cwd = data.get("cwd", "")
-        if cwd != old_path and not cwd.startswith(old_path + "/"):
+        if not is_path_under(cwd, old_path):
             continue
 
-        # Check if PID is dead (only update stale sessions)
+        # Skip live sessions; only update stale ones.
         pid = data.get("pid")
-        alive = False
-        if pid is not None:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except (ProcessLookupError, PermissionError):
-                pass
-
-        if alive:
+        if pid_alive(pid):
             log(f"  Skipping {fname} (session still active, pid={pid})")
             continue
 
@@ -804,6 +930,12 @@ def migrate_layer9_sessions(old_path: str, new_path: str) -> bool:
 def verify_no_residual(old_path: str, new_path: str, old_encoded: str, new_encoded: str) -> None:
     """Check modified files for any remaining old path references."""
     log("Verification: checking for residual old paths...")
+    needles = [(old_path, new_path), (old_encoded, new_encoded)]
+    if IS_WINDOWS and "\\" in old_path:
+        # Also check the JSON-escaped form (the dominant on-disk form for
+        # backslash-bearing paths inside JSON/JSONL).
+        needles.append((json_string_content(old_path), json_string_content(new_path)))
+
     residual_count = 0
     for fpath in modified_files:
         if not os.path.isfile(fpath):
@@ -811,7 +943,7 @@ def verify_no_residual(old_path: str, new_path: str, old_encoded: str, new_encod
         try:
             with open(fpath, "r", encoding="utf-8", errors="surrogateescape") as f:
                 content = f.read()
-            for needle, replacement in ((old_path, new_path), (old_encoded, new_encoded)):
+            for needle, replacement in needles:
                 hits = content.count(needle)
                 # Subtract occurrences that are part of the replacement string
                 # (e.g., /home/user/app inside /home/user/app-v2)
@@ -922,11 +1054,10 @@ def main() -> None:
     else:
         die("Expected 1 or 2 path arguments")
 
-    # Guard against catastrophically short paths — replacing "/" would
-    # corrupt every forward slash in every file.
+    # Guard against catastrophically short paths — replacing "/" or "\" would
+    # corrupt every separator in every file.
     for label, p in [("Old", old_path), ("New", new_path)]:
-        parts = [x for x in p.split("/") if x]
-        if len(parts) < 2:
+        if len(path_segments(p)) < 2:
             die(f"{label} path too short to be a project directory: {p}")
 
     if old_path == new_path:
@@ -937,12 +1068,12 @@ def main() -> None:
 
     # Guard against ancestor/descendant moves — str.replace would corrupt
     # entries that already reference the longer path (double-suffix bug).
-    if new_path.startswith(old_path + "/"):
+    if is_strictly_under(new_path, old_path):
         die(
             f"New path is inside old path ({new_path} ⊂ {old_path}). "
             f"Ancestor-to-descendant moves are not supported."
         )
-    if old_path.startswith(new_path + "/"):
+    if is_strictly_under(old_path, new_path):
         die(
             f"Old path is inside new path ({old_path} ⊂ {new_path}). "
             f"Descendant-to-ancestor moves are not supported."
@@ -977,18 +1108,18 @@ def main() -> None:
     claude_json_path = os.path.expanduser("~/.claude.json")
     if os.path.isfile(claude_json_path):
         try:
-            with open(claude_json_path, "r") as f:
+            with open(claude_json_path, "r", encoding="utf-8") as f:
                 cj = json.load(f)
             for key in cj.get("projects", {}):
-                if key != old_path and key.startswith(old_path + "/"):
-                    # Sub-project — this is expected and handled correctly
+                if key == old_path or is_strictly_under(key, old_path):
+                    # Same project or sub-project — handled correctly.
                     pass
-                elif key != old_path and key.startswith(old_path):
+                elif key.startswith(old_path):
                     warn(
                         f"Sibling project '{key}' shares prefix with old path '{old_path}'. "
                         f"Layer 6 value rewriting may affect it — verify after migration."
                     )
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             pass
 
     # ── Active session check ──────────────────────────────────────────
