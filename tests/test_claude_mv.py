@@ -527,6 +527,72 @@ class TestCrossAccount:
             assert r.returncode == 1
             assert any("both paths" in e for e in json.loads(r.stdout)["errors"])
 
+    def test_rollback_removes_copy_and_preserves_source_on_failure(self):
+        # Force a Layer 6 failure (corrupt destination .claude.json) AFTER Layer 1
+        # has copied the project in, then assert rollback removed the copied tree
+        # and never touched the source — the core data-safety property of copy mode.
+        with tempfile.TemporaryDirectory() as tmp:
+            src_home, dst_home, old, new = self._build(tmp)
+            src_proj = os.path.join(src_home, ".claude", "projects", _encode(old))
+            with open(os.path.join(dst_home, ".claude.json"), "w") as f:
+                f.write("{ this is not valid json")
+
+            r = run_in_home(dst_home, "--from-home", src_home, old, new, "--json")
+            assert r.returncode == 4  # EXIT_ROLLBACK
+            assert json.loads(r.stdout)["success"] is False
+
+            # Copied destination tree is gone (rollback removed what it created).
+            dst_proj = os.path.join(dst_home, ".claude", "projects", _encode(new))
+            assert not os.path.exists(dst_proj)
+            # Source is fully intact.
+            with open(os.path.join(src_proj, "session.jsonl")) as f:
+                assert old in f.read()
+
+    def test_rollback_merge_case_keeps_preexisting_dst_files(self):
+        # When the destination project dir ALREADY exists, rollback must unlink only
+        # the files/dirs we copied in and leave the pre-existing ones intact (the
+        # copy_created_root==None branch via created_files/created_dirs).
+        with tempfile.TemporaryDirectory() as tmp:
+            src_home, dst_home, old, new = self._build(tmp)
+            dst_proj = os.path.join(dst_home, ".claude", "projects", _encode(new))
+            os.makedirs(os.path.join(dst_proj, "sub"))
+            keeper = os.path.join(dst_proj, "sub", "preexisting.jsonl")
+            with open(keeper, "w") as f:
+                f.write("keep me\n")
+            with open(os.path.join(dst_home, ".claude.json"), "w") as f:
+                f.write("{ invalid")  # force Layer 6 failure → rollback
+
+            r = run_in_home(dst_home, "--from-home", src_home, old, new, "--json")
+            assert r.returncode == 4
+            # Pre-existing dst content survives; copied-in transcript is gone.
+            assert os.path.isfile(keeper)
+            assert not os.path.exists(os.path.join(dst_proj, "session.jsonl"))
+
+    def test_inject_creates_minimal_dst_claude_json_when_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_home, dst_home, old, new = self._build(tmp)
+            os.remove(os.path.join(dst_home, ".claude.json"))  # fresh dst account
+
+            r = run_in_home(dst_home, "--from-home", src_home, old, new, "--json")
+            assert r.returncode == 0, r.stdout + r.stderr
+            with open(os.path.join(dst_home, ".claude.json")) as f:
+                cj = json.load(f)
+            assert new in cj["projects"]
+            assert cj["projects"][new]["root"] == new
+
+    def test_missing_source_claude_json_is_noop_not_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_home, dst_home, old, new = self._build(tmp)
+            os.remove(os.path.join(src_home, ".claude.json"))  # source has no entry
+
+            r = run_in_home(dst_home, "--from-home", src_home, old, new, "--json")
+            assert r.returncode == 0, r.stdout + r.stderr
+            # Project dir still copied; dst .claude.json simply gains no new key.
+            dst_proj = os.path.join(dst_home, ".claude", "projects", _encode(new))
+            assert os.path.isfile(os.path.join(dst_proj, "session.jsonl"))
+            with open(os.path.join(dst_home, ".claude.json")) as f:
+                assert new not in json.load(f)["projects"]
+
 
 class TestCopyMode:
     """Same-account --copy: behaves like a move but leaves the source dir intact

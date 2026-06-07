@@ -10,6 +10,7 @@ Usage: claude-mv <old-path> <new-path> [flags]
 Flags:
   --copy                copy instead of move (leave source state intact)
   --from-home SRC_HOME  read source state from another account's home; implies --copy
+                        (<old> must be the literal path the source account used)
 
 Layers updated:
   1. ~/.claude/projects/<encoded>/          directory rename / deep merge / copy
@@ -55,6 +56,7 @@ backup_dir: str | None = None
 backup_manifest: list[tuple[str, str]] = []  # (backup_path, original_path)
 backup_renames: list[tuple[str, str]] = []  # (from, to) for dir renames
 created_files: list[str] = []  # files copied in (copy mode) — for rollback unlink
+created_dirs: list[str] = []  # dirs made in copy mode (merge case) — pruned on rollback
 copy_created_root: str | None = None  # dst project dir we created wholesale (copy mode)
 modified_files: list[str] = []  # track for post-migration verification
 manifest: list[dict[str, object]] = []  # per-file (file, refs, bytesBefore, bytesAfter) for external verification
@@ -166,6 +168,13 @@ def rollback() -> None:
                     log(f"  Removed copied file {f}")
             except OSError as e:
                 err(f"Rollback failed to remove {f}: {e}")
+        # Prune dirs we made (deepest first); rmdir only removes empty ones, so a
+        # dir that pre-existed or still holds files is left untouched.
+        for d in reversed(created_dirs):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
 
 
 # ── Safe replacement (str.replace — always literal) ───────────────────
@@ -717,7 +726,21 @@ def copy_tree_no_overwrite(src: str, dst: str) -> int:
                 warn(f"Copy conflict, skipped: {os.path.relpath(src_file, src)}")
                 continue
             if not dry_run:
-                os.makedirs(dst_root, exist_ok=True)
+                if not os.path.isdir(dst_root):
+                    # Record each ancestor we actually create (up to but not past
+                    # dst), so a merge-case rollback can prune exactly them and
+                    # leave pre-existing dirs alone. makedirs alone would create
+                    # intermediate levels we'd fail to track.
+                    missing = []
+                    probe = dst_root
+                    while probe != dst and not os.path.isdir(probe):
+                        missing.append(probe)
+                        parent = os.path.dirname(probe)
+                        if parent == probe:
+                            break
+                        probe = parent
+                    os.makedirs(dst_root, exist_ok=True)
+                    created_dirs.extend(reversed(missing))
                 shutil.copy2(src_file, dst_file)
                 created_files.append(dst_file)
             copied += 1
@@ -1445,7 +1468,8 @@ def main() -> None:
     for check_path in [history_path]:
         if os.path.isfile(check_path):
             total_bytes += os.path.getsize(check_path)
-    old_project_dir_pre = os.path.join(claude_dir, "projects", old_encoded)
+    # The project bytes live under the SOURCE claude dir (== dst same-account).
+    old_project_dir_pre = os.path.join(src_claude_dir, "projects", old_encoded)
     if os.path.isdir(old_project_dir_pre):
         for root, _, fnames in os.walk(old_project_dir_pre):
             for fn in fnames:
