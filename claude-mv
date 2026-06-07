@@ -59,9 +59,11 @@ backup_renames: list[tuple[str, str]] = []  # (from, to) for dir renames
 created_files: list[str] = []  # files copied in (copy mode) — for rollback unlink
 created_dirs: list[str] = []  # dirs made in copy mode (merge case) — pruned on rollback
 copy_created_root: str | None = None  # dst project dir we created wholesale (copy mode)
-created_fresh_files: list[str] = []  # dst files (history/.claude.json) we created from absent — rollback unlink
+# dst files (history/.claude.json) we created from absent — rollback unlinks them
+created_fresh_files: list[str] = []
 modified_files: list[str] = []  # track for post-migration verification
-manifest: list[dict[str, object]] = []  # per-file (file, refs, bytesBefore, bytesAfter) for external verification
+# per-file (file, refs, bytesBefore/After, linesBefore/After) for external verification
+manifest: list[dict[str, object]] = []
 json_mode = False
 dry_run = False
 migration_in_progress = False  # set True during layer execution
