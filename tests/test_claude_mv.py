@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 
+import pytest
+
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "claude-mv")
 
 
@@ -18,6 +20,56 @@ def run_claude_mv(*args: str, check: bool = False) -> subprocess.CompletedProces
         text=True,
         check=check,
     )
+
+
+def _encode(path: str) -> str:
+    return "".join("-" if ch in "/._-" else ch for ch in path)
+
+
+def run_in_home(
+    home: str, *args: str, env_overrides: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    """Run claude-mv with HOME overridden to an isolated fake home.
+
+    env_overrides lets a test alter the child environment — e.g. PATH="" to
+    hide getfacl and exercise the no-acl-tools fallback path.
+    """
+    env = os.environ.copy()
+    env["HOME"] = home
+    if env_overrides:
+        env.update(env_overrides)
+    return subprocess.run(
+        [sys.executable, SCRIPT, *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _load_module():
+    """Import the hyphen-named claude-mv script as a module for unit tests."""
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.SourceFileLoader("claude_mv_mod", SCRIPT)
+    spec = importlib.util.spec_from_loader("claude_mv_mod", loader)
+    assert spec is not None
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _acl_supported(tmpdir: str) -> bool:
+    """True if setfacl exists and the filesystem honors ACLs here."""
+    if shutil.which("setfacl") is None:
+        return False
+    probe = os.path.join(tmpdir, "_aclprobe")
+    with open(probe, "w") as f:
+        f.write("x")
+    r = subprocess.run(
+        ["setfacl", "-m", "u:0:r", probe], capture_output=True, text=True
+    )
+    return r.returncode == 0
 
 
 # ── Unit tests for encode_path ───────────────────────────────────────
@@ -224,6 +276,176 @@ class TestEndToEnd:
         assert r.returncode == 1
         data = json.loads(r.stdout)
         assert any("~/.claude" in e or ".claude" in e for e in data["errors"])
+
+
+# ── Readability preflight tests (#2) ─────────────────────────────────
+
+
+class TestReadabilityPreflight:
+    """Layer-0 preflight must fail up front on files it can't read, rather
+    than silently leaving stale paths (rewrite helpers return 0 on read error)."""
+
+    def _build(self, tmp: str, transcript_mode: int):
+        home = os.path.join(tmp, "home")
+        old_path = os.path.realpath(os.path.join(home, "work", "myapp"))
+        new_path = os.path.realpath(os.path.join(home, "work", "myapp-renamed"))
+        proj = os.path.join(home, ".claude", "projects", _encode(old_path))
+        os.makedirs(proj)
+        os.makedirs(new_path)
+        transcript = os.path.join(proj, "session.jsonl")
+        with open(transcript, "w") as f:
+            f.write(json.dumps({"cwd": old_path, "type": "user"}) + "\n")
+        os.chmod(transcript, transcript_mode)
+        return home, old_path, new_path, transcript
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+    def test_unreadable_blocks_migration(self):
+        # 0o000, owned by us → 'mode' category → chmod remediation, no false
+        # ACL-mask claim.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new, transcript = self._build(tmp, 0o000)
+            try:
+                r = run_in_home(home, old, new, "--json")
+                assert r.returncode == 1
+                data = json.loads(r.stdout)
+                assert data["success"] is False
+                joined = " ".join(data["errors"])
+                assert "silent partial migration" in joined
+                assert "session.jsonl" in joined
+                assert "chmod -R u+rX" in joined
+            finally:
+                os.chmod(transcript, 0o600)  # let TemporaryDirectory clean up
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+    def test_fallback_heuristic_recommends_setfacl_without_getfacl(self):
+        # Mode 0o044 (owner no read, group/other read advertised) with getfacl
+        # hidden via PATH="" → 'mask?' fallback → must steer to setfacl, since
+        # chmod o+r is a no-op against a named-user ACL entry.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new, transcript = self._build(tmp, 0o044)
+            try:
+                r = run_in_home(home, old, new, "--json", env_overrides={"PATH": ""})
+                assert r.returncode == 1
+                joined = " ".join(json.loads(r.stdout)["errors"])
+                assert "setfacl" in joined
+                assert "mask" in joined
+            finally:
+                os.chmod(transcript, 0o600)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+    def test_readable_files_pass_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new, _ = self._build(tmp, 0o600)
+            r = run_in_home(home, old, new, "--json")
+            assert r.returncode == 0
+            data = json.loads(r.stdout)
+            assert data["success"] is True
+
+
+class TestAclMaskDetection:
+    """Precise getfacl-based mask-clamp detection (replaces the old mode-bit
+    heuristic that over-claimed 'mask' for any group/other read bit)."""
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+    def test_detects_real_mask_clamp_and_clears_normal_file(self):
+        mod = _load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            if not _acl_supported(tmp):
+                pytest.skip("setfacl unavailable or filesystem lacks ACL support")
+            normal = os.path.join(tmp, "normal")
+            with open(normal, "w") as f:
+                f.write("x")
+            # No ACL clamp → False (getfacl ran, found nothing).
+            assert mod.acl_mask_clamps_read(normal) is False
+
+            clamped = os.path.join(tmp, "clamped")
+            with open(clamped, "w") as f:
+                f.write("x")
+            # Named-user grant of read, then clamp the mask to nothing → the
+            # entry's #effective perms lose read: the exact mask-clamp signature.
+            subprocess.run(["setfacl", "-m", "u:0:r", clamped], check=True)
+            subprocess.run(["setfacl", "-m", "mask::---", clamped], check=True)
+            assert mod.acl_mask_clamps_read(clamped) is True
+            # And classify_unreadable routes it to the 'mask' category.
+            assert mod.classify_unreadable(clamped) == "mask"
+
+    def test_returns_none_without_getfacl(self):
+        mod = _load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            f = os.path.join(tmp, "f")
+            with open(f, "w") as fh:
+                fh.write("x")
+            orig = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = ""  # hide getfacl from shutil.which
+                assert mod.acl_mask_clamps_read(f) is None
+            finally:
+                os.environ["PATH"] = orig
+
+
+# ── Completeness manifest tests (#4) ─────────────────────────────────
+
+
+class TestManifest:
+    """--json must carry a structured per-file manifest so external pre-rm
+    verification (basename-set + size-delta-direction + tail-parses-JSON) is
+    trivial — a naive byte-diff falsely flags loss because rewrites GROW files."""
+
+    def test_manifest_records_refs_and_sizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            old_path = os.path.realpath(os.path.join(home, "work", "app"))
+            # new path strictly longer → every rewritten file must grow
+            new_path = os.path.realpath(os.path.join(home, "work", "app-much-longer"))
+            proj = os.path.join(home, ".claude", "projects", _encode(old_path))
+            os.makedirs(proj)
+            os.makedirs(new_path)
+            transcript = os.path.join(proj, "session.jsonl")
+            with open(transcript, "w") as f:
+                f.write(json.dumps({"cwd": old_path, "type": "user"}) + "\n")
+                f.write(json.dumps({"file_path": old_path + "/main.py"}) + "\n")
+            # history.jsonl exercises the layer-5 manifest path
+            with open(os.path.join(home, ".claude", "history.jsonl"), "w") as f:
+                f.write(json.dumps({"project": old_path, "display": "hi"}) + "\n")
+
+            r = run_in_home(home, old_path, new_path, "--json")
+            assert r.returncode == 0, r.stdout + r.stderr
+            data = json.loads(r.stdout)
+            man = data["manifest"]
+            assert man, "manifest should not be empty"
+            for entry in man:
+                assert set(entry) >= {
+                    "file",
+                    "refs",
+                    "bytesBefore",
+                    "bytesAfter",
+                    "linesBefore",
+                    "linesAfter",
+                }
+                assert entry["refs"] >= 1
+                # rewrite grows the file here (new path is longer than old)...
+                assert entry["bytesAfter"] >= entry["bytesBefore"]
+                # ...but the direction-independent no-truncation invariant is
+                # that line count is preserved (paths contain no newlines).
+                assert entry["linesAfter"] == entry["linesBefore"]
+            files = {os.path.basename(e["file"]) for e in man}
+            assert "session.jsonl" in files
+            assert "history.jsonl" in files
+
+    def test_dry_run_manifest_empty(self):
+        """Dry run writes nothing, so the manifest stays empty (no false record)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            old_path = os.path.realpath(os.path.join(home, "work", "app"))
+            new_path = os.path.realpath(os.path.join(home, "work", "app2"))
+            proj = os.path.join(home, ".claude", "projects", _encode(old_path))
+            os.makedirs(proj)
+            os.makedirs(new_path)
+            with open(os.path.join(proj, "session.jsonl"), "w") as f:
+                f.write(json.dumps({"cwd": old_path}) + "\n")
+            r = run_in_home(home, old_path, new_path, "--dry-run", "--json")
+            data = json.loads(r.stdout)
+            assert data["manifest"] == []
 
 
 # ── Backslash safety tests ──────────────────────────────────────────

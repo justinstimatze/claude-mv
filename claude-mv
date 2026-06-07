@@ -24,12 +24,16 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import traceback
+from collections.abc import Callable
 from pathlib import Path
+from types import FrameType
+from typing import NoReturn
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # ── Exit codes ────────────────────────────────────────────────────────
 EXIT_OK = 0
@@ -39,19 +43,20 @@ EXIT_ACTIVE_SESSION = 3
 EXIT_ROLLBACK = 4
 
 # ── Global accumulators ───────────────────────────────────────────────
-changes: list[dict] = []
+changes: list[dict[str, object]] = []
 warnings: list[str] = []
 errors: list[str] = []
 backup_dir: str | None = None
 backup_manifest: list[tuple[str, str]] = []  # (backup_path, original_path)
 backup_renames: list[tuple[str, str]] = []  # (from, to) for dir renames
 modified_files: list[str] = []  # track for post-migration verification
+manifest: list[dict[str, object]] = []  # per-file (file, refs, bytesBefore, bytesAfter) for external verification
 json_mode = False
 dry_run = False
 migration_in_progress = False  # set True during layer execution
 
 
-def _signal_handler(signum: int, frame) -> None:
+def _signal_handler(signum: int, frame: FrameType | None) -> None:
     """Handle SIGINT/SIGTERM: rollback if mid-migration, then exit."""
     sig_name = signal.Signals(signum).name
     if migration_in_progress and not dry_run:
@@ -84,7 +89,7 @@ def err(msg: str) -> None:
     print(f"[claude-mv] ERROR: {msg}", file=sys.stderr)
 
 
-def die(msg: str, code: int = EXIT_FATAL) -> None:
+def die(msg: str, code: int = EXIT_FATAL) -> NoReturn:
     err(msg)
     if json_mode:
         emit_json_report(code)
@@ -184,6 +189,16 @@ def replace_in_file(filepath: str, old: str, new: str) -> int:
             new_content = content.replace(old, new)
             atomic_write(filepath, new_content, encoding_errors="surrogateescape")
             modified_files.append(filepath)
+            manifest.append(
+                {
+                    "file": filepath,
+                    "refs": count,
+                    "bytesBefore": len(content.encode("utf-8", "surrogateescape")),
+                    "bytesAfter": len(new_content.encode("utf-8", "surrogateescape")),
+                    "linesBefore": content.count("\n"),
+                    "linesAfter": new_content.count("\n"),
+                }
+            )
         except OSError as e:
             warn(f"Cannot write {filepath}: {e}")
             return 0
@@ -219,11 +234,37 @@ def rewrite_paths_in_file(
                 new_content = content.replace(old_path, new_path).replace(old_encoded, new_encoded)
             atomic_write(filepath, new_content, encoding_errors="surrogateescape")
             modified_files.append(filepath)
+            manifest.append(
+                {
+                    "file": filepath,
+                    "refs": total,
+                    "bytesBefore": len(content.encode("utf-8", "surrogateescape")),
+                    "bytesAfter": len(new_content.encode("utf-8", "surrogateescape")),
+                    "linesBefore": content.count("\n"),
+                    "linesAfter": new_content.count("\n"),
+                }
+            )
         except OSError as e:
             warn(f"Cannot write {filepath}: {e}")
             return 0
 
     return total
+
+
+# ── Regex replacement helper ──────────────────────────────────────────
+def const_repl(value: str) -> Callable[[re.Match[str]], str]:
+    """Return a re.sub replacement callable that yields `value` literally.
+
+    Using a callable (not a string) prevents re.sub from interpreting
+    backslash sequences (\\1, \\g<…>) in the replacement. Binding `value` as a
+    parameter — rather than closing over a loop variable — keeps it both
+    type-inferable (mypy) and free of loop-closure hazards (ruff B023).
+    """
+
+    def _repl(_m: re.Match[str]) -> str:
+        return value
+
+    return _repl
 
 
 # ── JSON validation ───────────────────────────────────────────────────
@@ -250,13 +291,13 @@ def encode_path(path: str) -> str:
 
 
 # ── Active session detection ──────────────────────────────────────────
-def check_active_sessions(old_path: str, force: bool) -> list[dict]:
+def check_active_sessions(old_path: str, force: bool) -> list[dict[str, object]]:
     """Check ~/.claude/sessions/ for live sessions on old_path. Returns list of active sessions."""
     sessions_dir = os.path.expanduser("~/.claude/sessions")
     if not os.path.isdir(sessions_dir):
         return []
 
-    active = []
+    active: list[dict[str, object]] = []
     for fname in os.listdir(sessions_dir):
         if not fname.endswith(".json"):
             continue
@@ -302,6 +343,102 @@ def check_active_sessions(old_path: str, force: bool) -> list[dict]:
     return active
 
 
+# ── Readability preflight ─────────────────────────────────────────────
+def acl_mask_clamps_read(fpath: str) -> bool | None:
+    """Does an ACL mask clamp READ off some entry of `fpath`?
+
+    Returns True if getfacl shows any user/group entry whose nominal perms grant
+    read but whose mask-reduced `#effective:` perms strip it — the exact, not
+    heuristic, signature of an ACL mask clamp. Returns False if getfacl ran and
+    found no such clamp. Returns None when getfacl is unavailable (caller falls
+    back to a mode-bit heuristic). Reading an ACL needs only inode metadata
+    access, so this works even on files whose *content* we cannot read.
+    """
+    getfacl = shutil.which("getfacl")
+    if getfacl is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [getfacl, "-p", fpath],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in proc.stdout.splitlines():
+        if "#effective:" not in line:
+            continue
+        nominal, _, effective = line.partition("#effective:")
+        nominal_perms = nominal.strip().rsplit(":", 1)[-1]
+        if "r" in nominal_perms and "r" not in effective:
+            return True
+    return False
+
+
+def classify_unreadable(fpath: str) -> str:
+    """Categorize WHY `fpath` is unreadable, to give correct remediation.
+
+    'mask'      — confirmed ACL mask clamp (getfacl). Fix: setfacl mask::rwx.
+    'mask?'     — group/other read advertised but denied, getfacl unavailable to
+                  confirm; likely a mask clamp. Fix: setfacl, or install acl.
+    'ownership' — owned by another account. Fix: as that account, chmod/setfacl.
+    'mode'      — we own it but the mode is too restrictive. Fix: chmod u+rX.
+    """
+    if acl_mask_clamps_read(fpath) is True:
+        return "mask"
+    try:
+        st = os.stat(fpath)
+        owned = st.st_uid == os.geteuid()
+        group_other_read = bool(st.st_mode & 0o044)
+    except OSError:
+        owned, group_other_read = False, False
+    if acl_mask_clamps_read(fpath) is None and group_other_read:
+        # No getfacl to confirm, but the mode advertises read it isn't honoring
+        # — the classic mask-clamp tell. chmod o+r would be a no-op against a
+        # named-user ACL entry, so still steer toward setfacl.
+        return "mask?"
+    return "mode" if owned else "ownership"
+
+
+def preflight_readability(old_project_dir: str, new_path: str) -> list[tuple[str, str]]:
+    """Scan every file claude-mv will READ for readability by the current uid.
+
+    Catches the silent-partial-migration hazard: rewrite_paths_in_file and
+    replace_in_file warn-and-return-0 on an unreadable file, so a transcript we
+    can't read gets 0 refs rewritten with no hard error — stale paths survive.
+
+    Returns (file, category) pairs for each unreadable file, where category comes
+    from classify_unreadable(). Sessions/ files are intentionally excluded: layer
+    9 already skips unreadable session files gracefully, and relevance can't be
+    judged without reading cwd.
+    """
+    targets: list[str] = []
+
+    if os.path.isdir(old_project_dir):
+        for p in Path(old_project_dir).rglob("*"):
+            if p.is_file():
+                targets.append(str(p))
+
+    for extra in (
+        os.path.expanduser("~/.claude/history.jsonl"),
+        os.path.expanduser("~/.claude.json"),
+        os.path.join(new_path, ".mcp.json"),
+        os.path.join(new_path, ".claude", "settings.json"),
+        os.path.join(new_path, ".claude", "settings.local.json"),
+    ):
+        if os.path.isfile(extra):
+            targets.append(extra)
+
+    unreadable: list[tuple[str, str]] = []
+    for fpath in targets:
+        if not os.access(fpath, os.R_OK):
+            unreadable.append((fpath, classify_unreadable(fpath)))
+
+    return unreadable
+
+
 # ── Auto-detect old path ──────────────────────────────────────────────
 def auto_detect_old_path(new_path: str) -> str | None:
     """Scan ~/.claude/projects/ for orphaned dirs that might be the old location."""
@@ -314,7 +451,7 @@ def auto_detect_old_path(new_path: str) -> str | None:
     candidates: list[tuple[str, int]] = []  # (encoded_dirname, score)
 
     # Read ~/.claude.json once for cross-referencing (not per-candidate)
-    cj_projects: dict = {}
+    cj_projects: dict[str, object] = {}
     claude_json_check = os.path.expanduser("~/.claude.json")
     if os.path.isfile(claude_json_check):
         try:
@@ -385,7 +522,7 @@ def auto_detect_old_path(new_path: str) -> str | None:
                             entry = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        project = entry.get("project", "")
+                        project: str = entry.get("project", "")
                         if encode_path(project) == best_encoded:
                             log(f"Auto-detected old path from history: {project}")
                             return project
@@ -629,7 +766,7 @@ def migrate_layer5_history(
                 replacement = '"project": ' + new_fragment
                 patched = re.sub(
                     r'"project"\s*:\s*' + re.escape(old_fragment),
-                    lambda m, r=replacement: r,
+                    const_repl(replacement),
                     stripped,
                     count=1,
                 )
@@ -643,8 +780,20 @@ def migrate_layer5_history(
     if count > 0:
         if not dry_run:
             backup_file(history)
-            atomic_write(history, "".join(new_lines))
+            old_bytes = sum(len(line.encode("utf-8", "surrogateescape")) for line in lines)
+            new_content = "".join(new_lines)
+            atomic_write(history, new_content)
             modified_files.append(history)
+            manifest.append(
+                {
+                    "file": history,
+                    "refs": count,
+                    "bytesBefore": old_bytes,
+                    "bytesAfter": len(new_content.encode("utf-8", "surrogateescape")),
+                    "linesBefore": len(lines),
+                    "linesAfter": len(new_lines),
+                }
+            )
         add_change(5, history, f"Rewrote {count} project entries")
     return True
 
@@ -838,6 +987,7 @@ def emit_json_report(exit_code: int) -> None:
         "exitCode": exit_code,
         "version": VERSION,
         "changes": changes,
+        "manifest": manifest,
         "warnings": warnings,
         "errors": errors,
         "backupDir": backup_dir,
@@ -998,6 +1148,58 @@ def main() -> None:
             emit_json_report(EXIT_ACTIVE_SESSION)
         sys.exit(EXIT_ACTIVE_SESSION)
 
+    # ── Readability preflight ─────────────────────────────────────────
+    # Fail up front if any file we must READ is unreadable by the current uid.
+    # Proceeding would silently leave stale paths (rewrite helpers return 0 on
+    # read failure). Not bypassable by --force: an unreadable file cannot be
+    # migrated, only mis-migrated.
+    preflight_old_dir = os.path.join(claude_dir, "projects", old_encoded)
+    unreadable = preflight_readability(preflight_old_dir, new_path)
+    if unreadable:
+        by_category: dict[str, list[str]] = {}
+        for fpath, category in unreadable:
+            err(f"Unreadable by current user [{category}]: {fpath}")
+            by_category.setdefault(category, []).append(fpath)
+
+        # Per-category remediation. ACL-mask categories steer to setfacl (chmod
+        # o+r is a no-op against a named-user ACL entry); ownership/mode steer to
+        # the owning account. -R targets the project dir, which holds the bulk;
+        # any stray file listed above (history.jsonl, .claude.json) needs the
+        # same treatment applied to it directly.
+        blocks: list[str] = []
+        if "mask" in by_category:
+            blocks.append(
+                f"{len(by_category['mask'])} file(s): CONFIRMED ACL mask clamp (getfacl shows "
+                f"read stripped by the mask). chmod o+r will NOT fix this. As the owning "
+                f"account run:\n    setfacl -R -m mask::rwx {preflight_old_dir}\n"
+                f"(or: chmod -R g+rX {preflight_old_dir} — chmod's group bits set the mask "
+                f"when an ACL is present)."
+            )
+        if "mask?" in by_category:
+            blocks.append(
+                f"{len(by_category['mask?'])} file(s): LIKELY an ACL mask clamp (mode advertises "
+                f"group/other read but access is denied; getfacl unavailable to confirm — "
+                f"install the 'acl' package). As the owning account run:\n"
+                f"    setfacl -R -m mask::rwx {preflight_old_dir}\n"
+                f"(or: chmod -R g+rX {preflight_old_dir})."
+            )
+        if "ownership" in by_category:
+            blocks.append(
+                f"{len(by_category['ownership'])} file(s): owned by another account. As that "
+                f"account run:\n    chmod -R u+rX {preflight_old_dir}\n"
+                f"or grant your account read via ACL:\n"
+                f"    setfacl -R -m u:$(id -un):rX {preflight_old_dir}"
+            )
+        if "mode" in by_category:
+            blocks.append(
+                f"{len(by_category['mode'])} file(s): you own these but the mode is too "
+                f"restrictive. Run:\n    chmod -R u+rX {preflight_old_dir}"
+            )
+        die(
+            f"{len(unreadable)} file(s) claude-mv must read are unreadable — aborting to "
+            f"avoid a silent partial migration.\n" + "\n".join(blocks)
+        )
+
     # ── Pre-flight size estimate ─────────────────────────────────────
     total_bytes = 0
     history_path = os.path.expanduser("~/.claude/history.jsonl")
@@ -1036,7 +1238,7 @@ def main() -> None:
 
     migration_in_progress = True
     layer_ok = True
-    layers = [
+    layers: list[tuple[int, Callable[[], bool]]] = [
         (1, lambda: migrate_layer1_project_dir(old_encoded, new_encoded, claude_dir)),
         (
             2,
