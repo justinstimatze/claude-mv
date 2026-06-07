@@ -448,6 +448,112 @@ class TestManifest:
             assert data["manifest"] == []
 
 
+# ── Cross-account copy tests (#1, #3, #5) ────────────────────────────
+
+
+class TestCrossAccount:
+    """--from-home reads another account's state and COPIES it in, injecting the
+    source's .claude.json project entry (rename-only would no-op cross-account)."""
+
+    def _build(self, tmp: str):
+        src_home = os.path.join(tmp, "src_home")
+        dst_home = os.path.join(tmp, "dst_home")
+        old_path = os.path.realpath(os.path.join(src_home, "Documents", "calque"))
+        new_path = os.path.realpath(os.path.join(dst_home, "Documents", "calque"))
+
+        # Source: a project dir with a transcript + a .claude.json project entry.
+        src_proj = os.path.join(src_home, ".claude", "projects", _encode(old_path))
+        os.makedirs(src_proj)
+        with open(os.path.join(src_proj, "session.jsonl"), "w") as f:
+            f.write(json.dumps({"cwd": old_path, "type": "user"}) + "\n")
+            f.write(json.dumps({"file_path": old_path + "/main.py"}) + "\n")
+        with open(os.path.join(src_home, ".claude.json"), "w") as f:
+            json.dump({"projects": {old_path: {"history": [], "root": old_path}}}, f)
+
+        # Destination account exists with its own (unrelated) state.
+        os.makedirs(os.path.join(dst_home, ".claude", "projects"))
+        os.makedirs(new_path)
+        with open(os.path.join(dst_home, ".claude.json"), "w") as f:
+            json.dump({"projects": {"/some/other/proj": {}}}, f)
+        return src_home, dst_home, old_path, new_path
+
+    def test_cross_account_copy_injects_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_home, dst_home, old, new = self._build(tmp)
+            src_proj = os.path.join(src_home, ".claude", "projects", _encode(old))
+
+            r = run_in_home(dst_home, "--from-home", src_home, old, new, "--json")
+            assert r.returncode == 0, r.stdout + r.stderr
+            data = json.loads(r.stdout)
+            assert data["success"] is True
+
+            # Destination project dir populated with the rewritten transcript.
+            dst_proj = os.path.join(dst_home, ".claude", "projects", _encode(new))
+            dst_transcript = os.path.join(dst_proj, "session.jsonl")
+            assert os.path.isfile(dst_transcript)
+            with open(dst_transcript) as f:
+                body = f.read()
+            assert new in body
+            assert old not in body
+
+            # Source is untouched (copy, not move).
+            assert os.path.isfile(os.path.join(src_proj, "session.jsonl"))
+            with open(os.path.join(src_proj, "session.jsonl")) as f:
+                assert old in f.read()
+
+            # Destination .claude.json gained the injected project key, kept its own.
+            with open(os.path.join(dst_home, ".claude.json")) as f:
+                dst_cj = json.load(f)
+            assert new in dst_cj["projects"]
+            assert dst_cj["projects"][new]["root"] == new
+            assert "/some/other/proj" in dst_cj["projects"]
+
+            # No "old directory still exists" warning under copy semantics.
+            assert not any("still exists" in w for w in data["warnings"])
+
+    def test_cross_account_missing_src_home_claude_dir_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, dst_home, old, new = self._build(tmp)
+            empty_src = os.path.join(tmp, "empty_src")
+            os.makedirs(empty_src)
+            r = run_in_home(dst_home, "--from-home", empty_src, old, new, "--json")
+            assert r.returncode == 1
+            assert any(".claude" in e for e in json.loads(r.stdout)["errors"])
+
+    def test_cross_account_requires_both_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_home, dst_home, _, new = self._build(tmp)
+            r = run_in_home(dst_home, "--from-home", src_home, new, "--json")
+            assert r.returncode == 1
+            assert any("both paths" in e for e in json.loads(r.stdout)["errors"])
+
+
+class TestCopyMode:
+    """Same-account --copy: behaves like a move but leaves the source dir intact
+    and suppresses the 'old directory still exists' warning."""
+
+    def test_copy_preserves_source_project_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            old_path = os.path.realpath(os.path.join(home, "work", "app"))
+            new_path = os.path.realpath(os.path.join(home, "work", "app-copy"))
+            proj = os.path.join(home, ".claude", "projects", _encode(old_path))
+            os.makedirs(proj)
+            os.makedirs(new_path)
+            with open(os.path.join(proj, "session.jsonl"), "w") as f:
+                f.write(json.dumps({"cwd": old_path}) + "\n")
+
+            r = run_in_home(home, old_path, new_path, "--copy", "--json")
+            assert r.returncode == 0, r.stdout + r.stderr
+            data = json.loads(r.stdout)
+
+            # Source project dir survives; destination got a copy.
+            assert os.path.isfile(os.path.join(proj, "session.jsonl"))
+            dst_proj = os.path.join(home, ".claude", "projects", _encode(new_path))
+            assert os.path.isfile(os.path.join(dst_proj, "session.jsonl"))
+            assert not any("still exists" in w for w in data["warnings"])
+
+
 # ── Backslash safety tests ──────────────────────────────────────────
 
 

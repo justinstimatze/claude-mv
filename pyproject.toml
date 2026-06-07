@@ -1,6 +1,6 @@
 [project]
 name = "claude-mv"
-version = "0.7.0"
+version = "0.8.0"
 description = "Update Claude Code's internal state when a project directory moves"
 requires-python = ">=3.11"
 dependencies = []

@@ -3,6 +3,43 @@
 All notable changes to claude-mv are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0]
+
+### Added
+
+- **Cross-account copy mode (`--from-home`).** claude-mv can now relocate a
+  project's state from *another account's* home into the current account, for the
+  cross-user copy case (`/home/alice/Documents/app` →
+  `/home/bob/Documents/app`). `--from-home SRC_HOME` reads source state from
+  `SRC_HOME/.claude` and `SRC_HOME/.claude.json` and **implies `--copy`** (the
+  source is left intact). Two layers gain a source/destination split:
+  - **Layer 1** copies the source project directory into the destination
+    (`shutil.copy2`, read-only on the source) instead of moving it. Rollback removes
+    only what was created in the destination; the source is never touched.
+  - **Layer 6** *injects* the source's `~/.claude.json` project entry into the
+    destination under the new key. Previously this layer only **renamed** an existing
+    key — in a fresh cross-account copy there is no key to rename, so the migrated
+    project never got a `.claude.json` entry. Missing source entry is a no-op; a
+    missing destination `.claude.json` is created minimally.
+
+  The readability preflight now targets the correct source (source project dir and
+  source `.claude.json`), so an unreadable source still fails up front rather than
+  silently migrating zero references.
+- **`--copy` flag.** Same-account copy: behaves like a move but copies the project
+  directory and leaves the source state in place. Suppresses the "old directory
+  still exists" warning (for a copy, the source is the intended end state) in favor
+  of an informational note.
+- **Source-account session warning.** Cross-account runs cannot reliably verify
+  whether a live Claude session is running as the *source* user (the active-session
+  check only sees the current account, and the source `sessions/` dir may be
+  unreadable). claude-mv now emits a best-effort warning — never a block — when it
+  finds, or cannot rule out, a source-account session on the project.
+
+### Changed
+
+- Version bumped to 0.8.0; `pyproject.toml` and the in-script `VERSION` kept in
+  lockstep.
+
 ## [0.7.0]
 
 ### Added

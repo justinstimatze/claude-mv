@@ -4,15 +4,20 @@ updating all path-dependent internal state so --continue, memory,
 and session history keep working.
 
 Usage: claude-mv <old-path> <new-path> [flags]
-       claude-mv <new-path> [flags]           # auto-detect old path
+       claude-mv <new-path> [flags]                       # auto-detect old path
+       claude-mv --from-home <src-home> <old> <new>       # cross-account copy
+
+Flags:
+  --copy                copy instead of move (leave source state intact)
+  --from-home SRC_HOME  read source state from another account's home; implies --copy
 
 Layers updated:
-  1. ~/.claude/projects/<encoded>/          directory rename / deep merge
+  1. ~/.claude/projects/<encoded>/          directory rename / deep merge / copy
   2. *.jsonl files                          cwd + file_path fields
   3. subagent *.jsonl + *.meta.json         stale paths in subagent transcripts
   4. memory/ files                          path refs in memory content
   5. ~/.claude/history.jsonl                "project" field
-  6. ~/.claude.json                         project key in "projects" object
+  6. ~/.claude.json                         project key in "projects" object (rename / inject)
   7. <new>/.mcp.json                        absolute paths in MCP config
   8. <new>/.claude/settings[.local].json    path refs in project settings
   9. ~/.claude/sessions/*.json              stale cwd in session tracking
@@ -33,7 +38,7 @@ from pathlib import Path
 from types import FrameType
 from typing import NoReturn
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 # ── Exit codes ────────────────────────────────────────────────────────
 EXIT_OK = 0
@@ -49,6 +54,8 @@ errors: list[str] = []
 backup_dir: str | None = None
 backup_manifest: list[tuple[str, str]] = []  # (backup_path, original_path)
 backup_renames: list[tuple[str, str]] = []  # (from, to) for dir renames
+created_files: list[str] = []  # files copied in (copy mode) — for rollback unlink
+copy_created_root: str | None = None  # dst project dir we created wholesale (copy mode)
 modified_files: list[str] = []  # track for post-migration verification
 manifest: list[dict[str, object]] = []  # per-file (file, refs, bytesBefore, bytesAfter) for external verification
 json_mode = False
@@ -143,6 +150,22 @@ def rollback() -> None:
                 log(f"  Reversed rename {dst} -> {src}")
         except OSError as e:
             err(f"Rollback rename failed {dst} -> {src}: {e}")
+    # Undo copy-mode staging (Layer 1 copy_tree_no_overwrite). The source is never
+    # touched in copy mode, so we only remove what we created in the destination.
+    if copy_created_root is not None and os.path.isdir(copy_created_root):
+        try:
+            shutil.rmtree(copy_created_root, ignore_errors=True)
+            log(f"  Removed copied project dir {copy_created_root}")
+        except OSError as e:
+            err(f"Rollback failed to remove {copy_created_root}: {e}")
+    else:
+        for f in reversed(created_files):
+            try:
+                if os.path.isfile(f):
+                    os.unlink(f)
+                    log(f"  Removed copied file {f}")
+            except OSError as e:
+                err(f"Rollback failed to remove {f}: {e}")
 
 
 # ── Safe replacement (str.replace — always literal) ───────────────────
@@ -343,6 +366,50 @@ def check_active_sessions(old_path: str, force: bool) -> list[dict[str, object]]
     return active
 
 
+def warn_source_sessions(src_claude_dir: str, old_path: str) -> None:
+    """Best-effort warning about live sessions in the SOURCE account (cross-account).
+
+    check_active_sessions only sees the current (destination) account. A live Claude
+    session running as the source user can still be writing to the source transcripts
+    we copy. We cannot reliably verify liveness across a uid boundary (os.kill gives
+    PermissionError for a live foreign-owned pid and the sessions/ dir may be 0700),
+    so this only WARNS — it never blocks.
+    """
+    sessions_dir = os.path.join(src_claude_dir, "sessions")
+    if not os.path.isdir(sessions_dir):
+        return
+    try:
+        fnames = os.listdir(sessions_dir)
+    except OSError:
+        warn(
+            f"Cannot read source sessions dir {sessions_dir} — unable to verify the "
+            f"source account has no live session on {old_path}. Close source sessions first."
+        )
+        return
+
+    for fname in fnames:
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(sessions_dir, fname)
+        try:
+            with open(fpath, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            # Unreadable session file is itself a signal we can't verify liveness.
+            warn(
+                f"Cannot read source session file {fname} — unable to verify source-account "
+                f"session liveness on {old_path}. Close source sessions first."
+            )
+            continue
+        cwd = data.get("cwd", "")
+        if cwd == old_path or cwd.startswith(old_path + "/"):
+            warn(
+                f"Source account has a session record for {cwd} (pid={data.get('pid')}). "
+                f"Liveness can't be verified across accounts — ensure it is closed before relying "
+                f"on the copy."
+            )
+
+
 # ── Readability preflight ─────────────────────────────────────────────
 def acl_mask_clamps_read(fpath: str) -> bool | None:
     """Does an ACL mask clamp READ off some entry of `fpath`?
@@ -402,12 +469,19 @@ def classify_unreadable(fpath: str) -> str:
     return "mode" if owned else "ownership"
 
 
-def preflight_readability(old_project_dir: str, new_path: str) -> list[tuple[str, str]]:
+def preflight_readability(
+    old_project_dir: str, new_path: str, claude_json: str, history: str
+) -> list[tuple[str, str]]:
     """Scan every file claude-mv will READ for readability by the current uid.
 
     Catches the silent-partial-migration hazard: rewrite_paths_in_file and
     replace_in_file warn-and-return-0 on an unreadable file, so a transcript we
     can't read gets 0 refs rewritten with no hard error — stale paths survive.
+
+    old_project_dir is the source project dir (copy mode reads it to copy; move mode
+    reads it in place). claude_json is the .claude.json Layer 6 reads (the SOURCE one
+    in cross-account mode, since that is where the project entry lives). history is
+    the destination history.jsonl Layer 5 reads.
 
     Returns (file, category) pairs for each unreadable file, where category comes
     from classify_unreadable(). Sessions/ files are intentionally excluded: layer
@@ -422,8 +496,8 @@ def preflight_readability(old_project_dir: str, new_path: str) -> list[tuple[str
                 targets.append(str(p))
 
     for extra in (
-        os.path.expanduser("~/.claude/history.jsonl"),
-        os.path.expanduser("~/.claude.json"),
+        history,
+        claude_json,
         os.path.join(new_path, ".mcp.json"),
         os.path.join(new_path, ".claude", "settings.json"),
         os.path.join(new_path, ".claude", "settings.local.json"),
@@ -619,27 +693,75 @@ def deep_merge_dirs(src: str, dst: str) -> int:
     return moved
 
 
+def copy_tree_no_overwrite(src: str, dst: str) -> int:
+    """Recursively COPY files from src to dst without overwriting. Returns count.
+
+    Copy-mode analogue of deep_merge_dirs: src is read-only (shutil.copy2), so it
+    is safe to run against another account's home. Records every file written and,
+    when the destination root did not pre-exist, the root itself, so rollback() can
+    remove exactly what we created without ever touching the source.
+    """
+    global copy_created_root
+    if not dry_run and not os.path.isdir(dst):
+        copy_created_root = dst
+
+    copied = 0
+    for root, _dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        dst_root = os.path.join(dst, rel) if rel != "." else dst
+
+        for fname in files:
+            src_file = os.path.join(root, fname)
+            dst_file = os.path.join(dst_root, fname)
+            if os.path.exists(dst_file):
+                warn(f"Copy conflict, skipped: {os.path.relpath(src_file, src)}")
+                continue
+            if not dry_run:
+                os.makedirs(dst_root, exist_ok=True)
+                shutil.copy2(src_file, dst_file)
+                created_files.append(dst_file)
+            copied += 1
+
+    return copied
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # MIGRATION LAYERS
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def migrate_layer1_project_dir(old_encoded: str, new_encoded: str, claude_dir: str) -> bool:
-    """Layer 1: Rename or deep-merge the project directory."""
+def migrate_layer1_project_dir(
+    old_encoded: str,
+    new_encoded: str,
+    src_claude_dir: str,
+    dst_claude_dir: str,
+    copy_mode: bool,
+) -> bool:
+    """Layer 1: Rename/deep-merge (move) or copy the project directory.
+
+    Same-account move (copy_mode False): src_claude_dir == dst_claude_dir, behavior
+    is byte-for-byte the original rename / deep-merge.
+    Copy mode (copy_mode True, incl. cross-account): read source project dir from
+    src_claude_dir and COPY it into dst_claude_dir, leaving the source intact.
+    """
     log("Layer 1: Project directory")
 
-    if old_encoded == new_encoded:
+    old_dir = os.path.join(src_claude_dir, "projects", old_encoded)
+    new_dir = os.path.join(dst_claude_dir, "projects", new_encoded)
+
+    if old_encoded == new_encoded and src_claude_dir == dst_claude_dir:
         log("  Encoded forms identical — no directory rename needed")
         return True
-
-    old_dir = os.path.join(claude_dir, "projects", old_encoded)
-    new_dir = os.path.join(claude_dir, "projects", new_encoded)
 
     if not os.path.isdir(old_dir):
         log("  Old project dir not found (already migrated?)")
         return True
 
-    if os.path.isdir(new_dir):
+    if copy_mode:
+        verb = "Merged-copied" if os.path.isdir(new_dir) else "Copied"
+        count = copy_tree_no_overwrite(old_dir, new_dir)
+        add_change(1, old_dir, f"{verb} {count} files into {new_encoded} (source preserved)")
+    elif os.path.isdir(new_dir):
         # Both exist — deep merge
         log("  Both dirs exist, deep merging...")
         count = deep_merge_dirs(old_dir, new_dir)
@@ -798,28 +920,48 @@ def migrate_layer5_history(
     return True
 
 
-def migrate_layer6_claude_json(old_path: str, new_path: str) -> bool:
-    """Layer 6: Update project key in ~/.claude.json."""
-    log("Layer 6: ~/.claude.json")
-    claude_json = os.path.expanduser("~/.claude.json")
+def migrate_layer6_claude_json(
+    old_path: str,
+    new_path: str,
+    src_claude_json: str,
+    dst_claude_json: str,
+    inject: bool,
+) -> bool:
+    """Layer 6: Update project key(s) in .claude.json.
+
+    Same-account (inject False): rename the existing project key(s) in-place in the
+    destination .claude.json — original behavior, src_claude_json == dst_claude_json.
+
+    Cross-account (inject True): the destination has no key to rename, so we INJECT —
+    read the source .claude.json, pull its project entry (and sub-keys) for old_path,
+    rewrite their internal paths, and write them into the destination under the new
+    key(s). A rename-only pass would no-op and the migrated project would never get a
+    .claude.json entry.
+    """
+    log("Layer 6: .claude.json")
+
+    # Path-boundary-aware replacement for JSON values: only replace old_path when
+    # followed by / (subpath), " (end of JSON string), or end of string. This
+    # prevents /app from corrupting /app-staging.
+    path_pattern = re.compile(re.escape(old_path) + r'(?=[/"]|$)')
+
+    if inject:
+        return _layer6_inject(old_path, new_path, src_claude_json, dst_claude_json, path_pattern)
+
+    claude_json = dst_claude_json
     if not os.path.isfile(claude_json):
-        log("  No ~/.claude.json (OK)")
+        log("  No .claude.json (OK)")
         return True
 
     try:
         with open(claude_json, "r") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        err(f"Cannot read ~/.claude.json: {e}")
+        err(f"Cannot read .claude.json: {e}")
         return False
 
     projects = data.get("projects", {})
     changed = False
-
-    # Path-boundary-aware replacement for JSON values: only replace old_path
-    # when followed by / (subpath), " (end of JSON string), or end of string.
-    # This prevents /app from corrupting /app-staging.
-    path_pattern = re.compile(re.escape(old_path) + r'(?=[/"]|$)')
 
     # Rename exact key and rewrite paths in values
     if old_path in projects:
@@ -850,10 +992,72 @@ def migrate_layer6_claude_json(old_path: str, new_path: str) -> bool:
         modified_files.append(claude_json)
 
         if not validate_json(claude_json):
-            err("~/.claude.json corrupted after rewrite!")
+            err(".claude.json corrupted after rewrite!")
             return False
 
     add_change(6, claude_json, "Updated project key(s)")
+    return True
+
+
+def _layer6_inject(
+    old_path: str,
+    new_path: str,
+    src_claude_json: str,
+    dst_claude_json: str,
+    path_pattern: re.Pattern[str],
+) -> bool:
+    """Cross-account branch of Layer 6: inject the source project entry into dst."""
+    if not os.path.isfile(src_claude_json):
+        log("  No source .claude.json — nothing to inject (OK)")
+        return True
+    try:
+        with open(src_claude_json, "r") as f:
+            src_data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        err(f"Cannot read source .claude.json: {e}")
+        return False
+
+    src_projects = src_data.get("projects", {})
+    entries: list[tuple[str, object]] = []
+    for key, val in src_projects.items():
+        if key == old_path or key.startswith(old_path + "/"):
+            new_key = new_path + key[len(old_path) :]
+            entries.append((new_key, val))
+
+    if not entries:
+        log("  No matching project key in source .claude.json (OK)")
+        return True
+
+    # Load destination (may be absent on a fresh account → start minimal).
+    dst_existed = os.path.isfile(dst_claude_json)
+    if dst_existed:
+        try:
+            with open(dst_claude_json, "r") as f:
+                dst_data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            err(f"Cannot read destination .claude.json: {e}")
+            return False
+    else:
+        dst_data = {}
+
+    dst_projects = dst_data.get("projects", {})
+    for new_key, val in entries:
+        if new_key in dst_projects:
+            log(f"  Overwriting existing destination key {new_key}")
+        val_str = path_pattern.sub(lambda m: new_path, json.dumps(val))
+        dst_projects[new_key] = json.loads(val_str)
+    dst_data["projects"] = dst_projects
+
+    if not dry_run:
+        if dst_existed:
+            backup_file(dst_claude_json)
+        atomic_write(dst_claude_json, json.dumps(dst_data, indent=2) + "\n")
+        modified_files.append(dst_claude_json)
+        if not validate_json(dst_claude_json):
+            err(".claude.json corrupted after inject!")
+            return False
+
+    add_change(6, dst_claude_json, f"Injected {len(entries)} project key(s) from source")
     return True
 
 
@@ -1051,17 +1255,31 @@ def main() -> None:
     parser.add_argument(
         "--force", action="store_true", help="Proceed even if active sessions detected"
     )
+    parser.add_argument(
+        "--copy",
+        action="store_true",
+        help="Copy instead of move: leave the source project state intact",
+    )
+    parser.add_argument(
+        "--from-home",
+        metavar="SRC_HOME",
+        help="Read source state from another account's home (e.g. /home/alice). Implies --copy.",
+    )
     parser.add_argument("--version", action="version", version=f"claude-mv {VERSION}")
     args = parser.parse_args()
 
     json_mode = args.json
     dry_run = args.dry_run
+    cross_account = bool(args.from_home)
+    copy_mode = args.copy or cross_account
 
     # ── Resolve paths ─────────────────────────────────────────────────
     if len(args.paths) == 2:
         old_path = os.path.realpath(args.paths[0])
         new_path = os.path.realpath(args.paths[1])
     elif len(args.paths) == 1:
+        if cross_account:
+            die("--from-home requires both paths: claude-mv --from-home <src_home> <old> <new>")
         new_path = os.path.realpath(args.paths[0])
         log(f"Auto-detecting old path for: {new_path}")
         detected = auto_detect_old_path(new_path)
@@ -1104,6 +1322,19 @@ def main() -> None:
     claude_dir = os.path.expanduser("~/.claude")
     if not os.path.isdir(claude_dir):
         die("No ~/.claude directory found")
+
+    # Destination is always the current account. Source differs only cross-account.
+    dst_claude_dir = claude_dir
+    dst_claude_json = os.path.expanduser("~/.claude.json")
+    if cross_account:
+        src_home = os.path.realpath(args.from_home)
+        src_claude_dir = os.path.join(src_home, ".claude")
+        src_claude_json = os.path.join(src_home, ".claude.json")
+        if not os.path.isdir(src_claude_dir):
+            die(f"Source home has no .claude directory: {src_claude_dir}")
+    else:
+        src_claude_dir = dst_claude_dir
+        src_claude_json = dst_claude_json
 
     old_encoded = encode_path(old_path)
     new_encoded = encode_path(new_path)
@@ -1148,13 +1379,21 @@ def main() -> None:
             emit_json_report(EXIT_ACTIVE_SESSION)
         sys.exit(EXIT_ACTIVE_SESSION)
 
+    # Cross-account: also warn about (unverifiable) live sessions in the source
+    # account. check_active_sessions above only sees the destination account.
+    if cross_account:
+        warn_source_sessions(src_claude_dir, old_path)
+
     # ── Readability preflight ─────────────────────────────────────────
     # Fail up front if any file we must READ is unreadable by the current uid.
     # Proceeding would silently leave stale paths (rewrite helpers return 0 on
     # read failure). Not bypassable by --force: an unreadable file cannot be
     # migrated, only mis-migrated.
-    preflight_old_dir = os.path.join(claude_dir, "projects", old_encoded)
-    unreadable = preflight_readability(preflight_old_dir, new_path)
+    preflight_old_dir = os.path.join(src_claude_dir, "projects", old_encoded)
+    preflight_history = os.path.expanduser("~/.claude/history.jsonl")
+    unreadable = preflight_readability(
+        preflight_old_dir, new_path, src_claude_json, preflight_history
+    )
     if unreadable:
         by_category: dict[str, list[str]] = {}
         for fpath, category in unreadable:
@@ -1226,20 +1465,30 @@ def main() -> None:
 
     # ── Run all layers ────────────────────────────────────────────────
     global migration_in_progress
-    old_project_dir = os.path.join(claude_dir, "projects", old_encoded)
+    old_project_dir = os.path.join(dst_claude_dir, "projects", old_encoded)
+    src_project_dir = os.path.join(src_claude_dir, "projects", old_encoded)
 
-    # After layer 1, files live in new_project_dir. In dry-run, they're still in old.
+    # After layer 1, files live in new_project_dir. In dry-run nothing is moved/copied,
+    # so they remain at the source (old_project_dir same-account, src_project_dir
+    # cross-account); pointing layers 2-4 there keeps dry-run previews accurate.
     def effective_project_dir() -> str:
         if os.path.isdir(new_project_dir):
             return new_project_dir
         if os.path.isdir(old_project_dir):
             return old_project_dir
+        if os.path.isdir(src_project_dir):
+            return src_project_dir
         return new_project_dir  # fallback
 
     migration_in_progress = True
     layer_ok = True
     layers: list[tuple[int, Callable[[], bool]]] = [
-        (1, lambda: migrate_layer1_project_dir(old_encoded, new_encoded, claude_dir)),
+        (
+            1,
+            lambda: migrate_layer1_project_dir(
+                old_encoded, new_encoded, src_claude_dir, dst_claude_dir, copy_mode
+            ),
+        ),
         (
             2,
             lambda: migrate_layer2_jsonl(
@@ -1259,7 +1508,12 @@ def main() -> None:
             ),
         ),
         (5, lambda: migrate_layer5_history(old_path, new_path, old_encoded, new_encoded)),
-        (6, lambda: migrate_layer6_claude_json(old_path, new_path)),
+        (
+            6,
+            lambda: migrate_layer6_claude_json(
+                old_path, new_path, src_claude_json, dst_claude_json, cross_account
+            ),
+        ),
         (7, lambda: migrate_layer7_mcp_json(new_path, old_path, old_encoded, new_encoded)),
         (8, lambda: migrate_layer8_settings(new_path, old_path, old_encoded, new_encoded)),
         (9, lambda: migrate_layer9_sessions(old_path, new_path)),
@@ -1292,9 +1546,13 @@ def main() -> None:
     # ── Report ────────────────────────────────────────────────────────
     exit_code = EXIT_OK if changes else EXIT_NOOP
 
-    # Check for old directory before emitting report so it's included in JSON
+    # Check for old directory before emitting report so it's included in JSON. Under
+    # copy mode the source is meant to remain, so this is informational, not a warning.
     if os.path.isdir(old_path) and not dry_run and exit_code == EXIT_OK:
-        warn(f"Old directory still exists at {old_path}")
+        if copy_mode:
+            log(f"Source preserved at {old_path} (copy mode — remove it yourself if desired)")
+        else:
+            warn(f"Old directory still exists at {old_path}")
 
     if json_mode:
         emit_json_report(exit_code)
