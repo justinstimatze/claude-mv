@@ -11,13 +11,14 @@ Flags:
   --copy                copy instead of move (leave source state intact)
   --from-home SRC_HOME  read source state from another account's home; implies --copy
                         (<old> must be the literal path the source account used)
+  --with-history        copy mode only: also carry the project's history.jsonl lines
 
 Layers updated:
   1. ~/.claude/projects/<encoded>/          directory rename / deep merge / copy
   2. *.jsonl files                          cwd + file_path fields
   3. subagent *.jsonl + *.meta.json         stale paths in subagent transcripts
   4. memory/ files                          path refs in memory content
-  5. ~/.claude/history.jsonl                "project" field
+  5. ~/.claude/history.jsonl                "project" field (rewrite / copy-append)
   6. ~/.claude.json                         project key in "projects" object (rename / inject)
   7. <new>/.mcp.json                        absolute paths in MCP config
   8. <new>/.claude/settings[.local].json    path refs in project settings
@@ -39,7 +40,7 @@ from pathlib import Path
 from types import FrameType
 from typing import NoReturn
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 # ── Exit codes ────────────────────────────────────────────────────────
 EXIT_OK = 0
@@ -58,6 +59,7 @@ backup_renames: list[tuple[str, str]] = []  # (from, to) for dir renames
 created_files: list[str] = []  # files copied in (copy mode) — for rollback unlink
 created_dirs: list[str] = []  # dirs made in copy mode (merge case) — pruned on rollback
 copy_created_root: str | None = None  # dst project dir we created wholesale (copy mode)
+created_fresh_files: list[str] = []  # dst files (history/.claude.json) we created from absent — rollback unlink
 modified_files: list[str] = []  # track for post-migration verification
 manifest: list[dict[str, object]] = []  # per-file (file, refs, bytesBefore, bytesAfter) for external verification
 json_mode = False
@@ -175,6 +177,15 @@ def rollback() -> None:
                 os.rmdir(d)
             except OSError:
                 pass
+    # Remove dst files we created from absent (history.jsonl / .claude.json). They
+    # had no prior content to back up, so the clean undo is to delete them.
+    for f in reversed(created_fresh_files):
+        try:
+            if os.path.isfile(f):
+                os.unlink(f)
+                log(f"  Removed created file {f}")
+        except OSError as e:
+            err(f"Rollback failed to remove {f}: {e}")
 
 
 # ── Safe replacement (str.replace — always literal) ───────────────────
@@ -870,17 +881,66 @@ def migrate_layer4_memory(
     return True
 
 
-def migrate_layer5_history(
-    old_path: str, new_path: str, old_encoded: str, new_encoded: str
-) -> bool:
-    """Layer 5: Rewrite project field in history.jsonl (JSON-aware, not blind str.replace).
+def _splice_history_project(stripped: str, old_path: str, new_path: str) -> tuple[str, bool]:
+    """Rewrite only the 'project' field of a history line if it is under old_path.
 
-    Using str.replace on history.jsonl would corrupt sibling projects whose paths
-    share a prefix with old_path (e.g., /app vs /app-staging). Instead, we parse
-    each line as JSON and only modify the "project" field on exact match.
+    Returns (line, changed). Splices the value anchored to the "project" key so an
+    identical value in another field (e.g. cwd) is left alone, and uses const_repl
+    so backslash sequences in the path aren't interpreted as regex backreferences.
+    A line that isn't JSON, or whose project isn't under old_path, returns unchanged.
+    """
+    try:
+        entry = json.loads(stripped)
+    except json.JSONDecodeError:
+        return stripped, False
+    project = entry.get("project", "")
+    if not (project == old_path or project.startswith(old_path + "/")):
+        return stripped, False
+    new_project = new_path + project[len(old_path) :]
+    old_fragment = json.dumps(project)
+    new_fragment = json.dumps(new_project)
+    replacement = '"project": ' + new_fragment
+    patched = re.sub(
+        r'"project"\s*:\s*' + re.escape(old_fragment),
+        const_repl(replacement),
+        stripped,
+        count=1,
+    )
+    return patched, True
+
+
+def migrate_layer5_history(
+    old_path: str,
+    new_path: str,
+    old_encoded: str,
+    new_encoded: str,
+    copy_mode: bool,
+    with_history: bool,
+    src_history: str,
+    dst_history: str,
+) -> bool:
+    """Layer 5: Carry the project's history.jsonl lines (JSON-aware, not str.replace).
+
+    Move (copy_mode False): rewrite the "project" field in place on dst_history.
+    Copy without --with-history: leave history untouched — rewriting in place would
+      strip the preserved source's history association, and the destination has no
+      lines for this project to rewrite. This is the safe, non-destructive default.
+    Copy with --with-history: DUPLICATE — append rewritten copies of the project's
+      source-history lines to dst_history, leaving the originals intact.
+
+    Parsing each line as JSON and only touching the "project" field (never blind
+    str.replace) keeps sibling projects sharing a path prefix (/app vs /app-staging)
+    safe.
     """
     log("Layer 5: history.jsonl")
-    history = os.path.expanduser("~/.claude/history.jsonl")
+
+    if copy_mode and not with_history:
+        log("  Copy mode without --with-history: history.jsonl left untouched")
+        return True
+    if copy_mode and with_history:
+        return _layer5_append_history(old_path, new_path, src_history, dst_history)
+
+    history = dst_history
     if not os.path.isfile(history):
         log("  No history.jsonl (OK)")
         return True
@@ -899,27 +959,11 @@ def migrate_layer5_history(
         if not stripped:
             new_lines.append(line)
             continue
-        try:
-            entry = json.loads(stripped)
-            project = entry.get("project", "")
-            if project == old_path or project.startswith(old_path + "/"):
-                new_project = new_path + project[len(old_path) :]
-                # Splice only the "project" value, anchored to the key name,
-                # to avoid replacing an identical value in a different field.
-                old_fragment = json.dumps(project)
-                new_fragment = json.dumps(new_project)
-                replacement = '"project": ' + new_fragment
-                patched = re.sub(
-                    r'"project"\s*:\s*' + re.escape(old_fragment),
-                    const_repl(replacement),
-                    stripped,
-                    count=1,
-                )
-                new_lines.append(patched + "\n")
-                count += 1
-            else:
-                new_lines.append(line)
-        except json.JSONDecodeError:
+        patched, changed = _splice_history_project(stripped, old_path, new_path)
+        if changed:
+            new_lines.append(patched + "\n")
+            count += 1
+        else:
             new_lines.append(line)
 
     if count > 0:
@@ -940,6 +984,64 @@ def migrate_layer5_history(
                 }
             )
         add_change(5, history, f"Rewrote {count} project entries")
+    return True
+
+
+def _layer5_append_history(
+    old_path: str, new_path: str, src_history: str, dst_history: str
+) -> bool:
+    """Copy-mode --with-history: append the source project's history lines to dst.
+
+    Purely additive: originals (in src_history, possibly == dst_history same-account)
+    are never modified. No manifest entry is recorded — the manifest's line-count
+    invariant is for in-place rewrites, and an append intentionally grows the file.
+    """
+    if not os.path.isfile(src_history):
+        log("  No source history.jsonl — nothing to carry (OK)")
+        return True
+    try:
+        with open(src_history, "r", encoding="utf-8") as f:
+            src_lines = f.readlines()
+    except OSError as e:
+        warn(f"Cannot read source history.jsonl: {e}")
+        return True
+
+    appended = []
+    for line in src_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        patched, changed = _splice_history_project(stripped, old_path, new_path)
+        if changed:
+            appended.append(patched + "\n")
+
+    if not appended:
+        log("  No source history lines for this project (OK)")
+        return True
+
+    dst_existed = os.path.isfile(dst_history)
+    dst_content = ""
+    if dst_existed:
+        try:
+            with open(dst_history, "r", encoding="utf-8") as f:
+                dst_content = f.read()
+        except OSError as e:
+            warn(f"Cannot read destination history.jsonl: {e}")
+            return True
+    if dst_content and not dst_content.endswith("\n"):
+        dst_content += "\n"
+    new_content = dst_content + "".join(appended)
+
+    if not dry_run:
+        if dst_existed:
+            backup_file(dst_history)
+        else:
+            created_fresh_files.append(dst_history)  # rollback deletes it
+        atomic_write(dst_history, new_content)
+        # Deliberately NOT added to modified_files: residual-scanning historical
+        # display text (which legitimately mentions the old path) would mislead.
+
+    add_change(5, dst_history, f"Appended {len(appended)} history line(s) from source (copy)")
     return True
 
 
@@ -1074,6 +1176,8 @@ def _layer6_inject(
     if not dry_run:
         if dst_existed:
             backup_file(dst_claude_json)
+        else:
+            created_fresh_files.append(dst_claude_json)  # rollback deletes it
         atomic_write(dst_claude_json, json.dumps(dst_data, indent=2) + "\n")
         modified_files.append(dst_claude_json)
         if not validate_json(dst_claude_json):
@@ -1288,6 +1392,11 @@ def main() -> None:
         metavar="SRC_HOME",
         help="Read source state from another account's home (e.g. /home/alice). Implies --copy.",
     )
+    parser.add_argument(
+        "--with-history",
+        action="store_true",
+        help="Copy mode only: also carry the project's history.jsonl lines to the new location.",
+    )
     parser.add_argument("--version", action="version", version=f"claude-mv {VERSION}")
     args = parser.parse_args()
 
@@ -1295,6 +1404,9 @@ def main() -> None:
     dry_run = args.dry_run
     cross_account = bool(args.from_home)
     copy_mode = args.copy or cross_account
+    with_history = args.with_history
+    if with_history and not copy_mode:
+        die("--with-history only applies to copy mode (use with --copy or --from-home)")
 
     # ── Resolve paths ─────────────────────────────────────────────────
     if len(args.paths) == 2:
@@ -1349,15 +1461,18 @@ def main() -> None:
     # Destination is always the current account. Source differs only cross-account.
     dst_claude_dir = claude_dir
     dst_claude_json = os.path.expanduser("~/.claude.json")
+    dst_history = os.path.expanduser("~/.claude/history.jsonl")
     if cross_account:
         src_home = os.path.realpath(args.from_home)
         src_claude_dir = os.path.join(src_home, ".claude")
         src_claude_json = os.path.join(src_home, ".claude.json")
+        src_history = os.path.join(src_claude_dir, "history.jsonl")
         if not os.path.isdir(src_claude_dir):
             die(f"Source home has no .claude directory: {src_claude_dir}")
     else:
         src_claude_dir = dst_claude_dir
         src_claude_json = dst_claude_json
+        src_history = dst_history
 
     old_encoded = encode_path(old_path)
     new_encoded = encode_path(new_path)
@@ -1413,7 +1528,14 @@ def main() -> None:
     # read failure). Not bypassable by --force: an unreadable file cannot be
     # migrated, only mis-migrated.
     preflight_old_dir = os.path.join(src_claude_dir, "projects", old_encoded)
-    preflight_history = os.path.expanduser("~/.claude/history.jsonl")
+    # Check the history file Layer 5 will actually read: src under --with-history,
+    # dst on a move, and none when copy mode leaves history untouched.
+    if copy_mode and not with_history:
+        preflight_history = ""
+    elif copy_mode and with_history:
+        preflight_history = src_history
+    else:
+        preflight_history = dst_history
     unreadable = preflight_readability(
         preflight_old_dir, new_path, src_claude_json, preflight_history
     )
@@ -1531,7 +1653,19 @@ def main() -> None:
                 effective_project_dir(), old_path, new_path, old_encoded, new_encoded
             ),
         ),
-        (5, lambda: migrate_layer5_history(old_path, new_path, old_encoded, new_encoded)),
+        (
+            5,
+            lambda: migrate_layer5_history(
+                old_path,
+                new_path,
+                old_encoded,
+                new_encoded,
+                copy_mode,
+                with_history,
+                src_history,
+                dst_history,
+            ),
+        ),
         (
             6,
             lambda: migrate_layer6_claude_json(

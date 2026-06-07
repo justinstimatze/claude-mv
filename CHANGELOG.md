@@ -3,6 +3,33 @@
 All notable changes to claude-mv are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.0]
+
+### Added
+
+- **`--with-history`.** In copy mode, also carries the project's `history.jsonl`
+  lines (the reverse-search prompt history) to the new location. It is purely
+  *additive*: the source's lines are read, their `project` field is rewritten to the
+  new path, and the copies are **appended** to the destination history — originals
+  are never modified. Cross-account (`--from-home`) pulls from the source account's
+  history; same-account `--copy` duplicates within the one file. Off by default
+  (the project's history doesn't carry unless asked), and rejected outside copy mode
+  (a move carries history automatically).
+
+### Fixed
+
+- **`--copy` no longer strips the source's history association.** Same-account
+  `--copy` previously ran Layer 5's in-place rewrite, which changed the *preserved*
+  source project's `history.jsonl` lines to point at the new path — so the source
+  you intentionally kept lost its reverse-search history. Copy mode now leaves
+  `history.jsonl` untouched by default, and only *adds* lines under `--with-history`.
+  Layer 5 is now copy-aware: rewrite-in-place on a move, append-or-skip on a copy.
+
+### Changed
+
+- Version bumped to 0.9.0; `pyproject.toml` and the in-script `VERSION` kept in
+  lockstep.
+
 ## [0.8.0]
 
 ### Added

@@ -620,6 +620,132 @@ class TestCopyMode:
             assert not any("still exists" in w for w in data["warnings"])
 
 
+class TestWithHistory:
+    """Layer 5 is copy-aware: move rewrites in place, copy leaves history alone by
+    default (fixing the source-history-stripping bug), --with-history appends."""
+
+    def _build_same_account(self, tmp: str):
+        home = os.path.join(tmp, "home")
+        old = os.path.realpath(os.path.join(home, "work", "a"))
+        new = os.path.realpath(os.path.join(home, "work", "b"))
+        proj = os.path.join(home, ".claude", "projects", _encode(old))
+        os.makedirs(proj)
+        os.makedirs(new)
+        with open(os.path.join(proj, "s.jsonl"), "w") as f:
+            f.write(json.dumps({"cwd": old}) + "\n")
+        with open(os.path.join(home, ".claude", "history.jsonl"), "w") as f:
+            f.write(json.dumps({"project": old, "display": "p1"}) + "\n")
+            f.write(json.dumps({"project": "/other", "display": "unrelated"}) + "\n")
+        return home, old, new
+
+    def _history_projects(self, home: str):
+        out = []
+        with open(os.path.join(home, ".claude", "history.jsonl")) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line)["project"])
+        return out
+
+    def test_copy_without_with_history_preserves_source_history(self):
+        # The bug fix: --copy must NOT rewrite the preserved source's history line.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new = self._build_same_account(tmp)
+            r = run_in_home(home, old, new, "--copy", "--json")
+            assert r.returncode == 0, r.stdout + r.stderr
+            projects = self._history_projects(home)
+            assert old in projects  # source association intact
+            assert new not in projects  # nothing carried without the flag
+            assert "/other" in projects
+
+    def test_copy_with_history_appends_and_keeps_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new = self._build_same_account(tmp)
+            r = run_in_home(home, old, new, "--copy", "--with-history", "--json")
+            assert r.returncode == 0, r.stdout + r.stderr
+            projects = self._history_projects(home)
+            assert old in projects  # original preserved
+            assert new in projects  # rewritten copy appended
+            assert "/other" in projects
+
+    def test_move_still_rewrites_history_in_place(self):
+        # Regression guard: a plain move must keep rewriting in place (old -> new).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new = self._build_same_account(tmp)
+            r = run_in_home(home, old, new, "--json")
+            assert r.returncode == 0, r.stdout + r.stderr
+            projects = self._history_projects(home)
+            assert old not in projects
+            assert new in projects
+
+    def test_cross_account_with_history_carries_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_home = os.path.join(tmp, "src")
+            dst_home = os.path.join(tmp, "dst")
+            old = os.path.realpath(os.path.join(src_home, "Documents", "calque"))
+            new = os.path.realpath(os.path.join(dst_home, "Documents", "calque"))
+            src_proj = os.path.join(src_home, ".claude", "projects", _encode(old))
+            os.makedirs(src_proj)
+            os.makedirs(new)
+            os.makedirs(os.path.join(dst_home, ".claude", "projects"))
+            with open(os.path.join(src_proj, "s.jsonl"), "w") as f:
+                f.write(json.dumps({"cwd": old}) + "\n")
+            with open(os.path.join(src_home, ".claude", "history.jsonl"), "w") as f:
+                f.write(json.dumps({"project": old, "display": "p1"}) + "\n")
+            with open(os.path.join(dst_home, ".claude", "history.jsonl"), "w") as f:
+                f.write(json.dumps({"project": "/dst/native", "display": "keep"}) + "\n")
+
+            r = run_in_home(dst_home, "--from-home", src_home, old, new, "--with-history", "--json")
+            assert r.returncode == 0, r.stdout + r.stderr
+            # Destination history gained the rewritten line, kept its own.
+            dst_projects = self._history_projects(dst_home)
+            assert new in dst_projects
+            assert "/dst/native" in dst_projects
+            # Source history is untouched (still references old, no new line).
+            with open(os.path.join(src_home, ".claude", "history.jsonl")) as f:
+                src_body = f.read()
+            assert old in src_body
+            assert new not in src_body
+
+    def test_with_history_rejected_outside_copy_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new = self._build_same_account(tmp)
+            r = run_in_home(home, old, new, "--with-history", "--json")
+            assert r.returncode == 1
+            assert any("copy mode" in e for e in json.loads(r.stdout)["errors"])
+
+    def test_rollback_deletes_freshly_created_dst_history(self):
+        # Layer 5 (--with-history) creates a dst history.jsonl that did not exist,
+        # then Layer 6 fails (corrupt SOURCE .claude.json) -> rollback must delete
+        # the freshly-created file rather than leave a partial one behind.
+        with tempfile.TemporaryDirectory() as tmp:
+            src_home = os.path.join(tmp, "src")
+            dst_home = os.path.join(tmp, "dst")
+            old = os.path.realpath(os.path.join(src_home, "Documents", "p"))
+            new = os.path.realpath(os.path.join(dst_home, "Documents", "p"))
+            src_proj = os.path.join(src_home, ".claude", "projects", _encode(old))
+            os.makedirs(src_proj)
+            os.makedirs(new)
+            os.makedirs(os.path.join(dst_home, ".claude", "projects"))
+            with open(os.path.join(src_proj, "s.jsonl"), "w") as f:
+                f.write(json.dumps({"cwd": old}) + "\n")
+            with open(os.path.join(src_home, ".claude", "history.jsonl"), "w") as f:
+                f.write(json.dumps({"project": old, "display": "p1"}) + "\n")
+            # Corrupt source .claude.json so Layer 6 fails after Layer 5 appended.
+            with open(os.path.join(src_home, ".claude.json"), "w") as f:
+                f.write("{ not json")
+            dst_history = os.path.join(dst_home, ".claude", "history.jsonl")
+            assert not os.path.exists(dst_history)
+
+            r = run_in_home(dst_home, "--from-home", src_home, old, new, "--with-history", "--json")
+            assert r.returncode == 4  # EXIT_ROLLBACK
+            # Freshly-created dst history removed; copied project tree removed too.
+            assert not os.path.exists(dst_history)
+            assert not os.path.exists(
+                os.path.join(dst_home, ".claude", "projects", _encode(new))
+            )
+
+
 # ── Backslash safety tests ──────────────────────────────────────────
 
 
