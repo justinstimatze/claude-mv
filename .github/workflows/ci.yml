@@ -22,6 +22,19 @@ jobs:
       - name: Ruff format
         run: ruff format --check claude-mv
 
+  typecheck:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mypy
+      - name: Mypy
+        run: mypy claude-mv
+
   test:
     runs-on: ubuntu-latest
     permissions:
